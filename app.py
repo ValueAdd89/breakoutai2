@@ -21,6 +21,13 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
+import sys
+import os
+
+# Ensure project root is on sys.path (required for Streamlit Cloud)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 try:
     from streamlit_autorefresh import st_autorefresh
