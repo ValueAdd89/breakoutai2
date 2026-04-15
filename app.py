@@ -21,7 +21,12 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
-from streamlit_autorefresh import st_autorefresh
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAS_AUTOREFRESH = True
+except ImportError:
+    HAS_AUTOREFRESH = False
 
 from utils.data import fetch_batch_data, fetch_intraday, get_ticker_info, DEFAULT_TICKERS
 from utils.features import compute_features, FEATURE_COLS
@@ -36,8 +41,9 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# ─── Auto-refresh every 5 minutes ────────────────────────────────
-refresh_count = st_autorefresh(interval=300_000, limit=None, key="data_refresh")
+# ─── Auto-refresh every 5 minutes (graceful if package missing) ──
+if HAS_AUTOREFRESH:
+    refresh_count = st_autorefresh(interval=300_000, limit=None, key="data_refresh")
 
 # ─── Apple-Inspired CSS ──────────────────────────────────────────
 st.markdown("""
