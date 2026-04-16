@@ -1,12 +1,10 @@
 """
-Market data fetching — PERFORMANCE OPTIMIZED.
-
-Key optimizations:
-  1. Single yf.download() call for ALL tickers at once (one HTTP batch)
-  2. ThreadPoolExecutor fallback for retries on failed tickers
-  3. Aggressive TTL caching at both batch and individual levels
-  4. Timeout guards to prevent hanging on slow API responses
+Market data fetching — batch optimized.
+Single yf.download() for all tickers, parallel retry for failures.
 """
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import streamlit as st
 import yfinance as yf
@@ -14,44 +12,78 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# Default watchlist
-DEFAULT_TICKERS = [
+# ── Large-cap + Mid-cap watchlist ─────────────────────────────────
+LARGE_CAP_TICKERS = [
     "AAPL", "NVDA", "MSFT", "GOOGL", "AMZN", "META",
     "TSLA", "JPM", "V", "UNH", "LLY", "AVGO",
-    "AMD", "NFLX", "CRM", "COST", "PEP", "INTC",
 ]
 
+# ── Penny / Small-cap breakout candidates ─────────────────────────
+# High-volatility, low-float names that pro traders scan for breakouts
+PENNY_TICKERS = [
+    "SOFI", "PLTR", "NIO", "MARA", "RIOT", "LCID",
+    "PLUG", "BB", "OPEN", "DNA", "IONQ", "QUBT",
+    "SOUN", "RGTI", "BTBT", "HIMS", "CIFR", "PSNY",
+]
+
+DEFAULT_TICKERS = LARGE_CAP_TICKERS + PENNY_TICKERS
+
 TICKER_META = {
-    "AAPL": ("Apple Inc.", "Technology"),
-    "NVDA": ("NVIDIA Corp.", "Semiconductors"),
-    "MSFT": ("Microsoft Corp.", "Technology"),
-    "GOOGL": ("Alphabet Inc.", "Technology"),
-    "AMZN": ("Amazon.com Inc.", "Consumer"),
-    "META": ("Meta Platforms", "Technology"),
-    "TSLA": ("Tesla Inc.", "Automotive"),
-    "JPM": ("JPMorgan Chase", "Finance"),
-    "V": ("Visa Inc.", "Finance"),
-    "UNH": ("UnitedHealth", "Healthcare"),
-    "LLY": ("Eli Lilly", "Healthcare"),
-    "AVGO": ("Broadcom Inc.", "Semiconductors"),
-    "AMD": ("AMD Inc.", "Semiconductors"),
-    "NFLX": ("Netflix Inc.", "Entertainment"),
-    "CRM": ("Salesforce Inc.", "Technology"),
-    "COST": ("Costco Wholesale", "Consumer"),
-    "PEP": ("PepsiCo Inc.", "Consumer"),
-    "INTC": ("Intel Corp.", "Semiconductors"),
+    "AAPL": ("Apple Inc.", "Large Cap", "Technology"),
+    "NVDA": ("NVIDIA Corp.", "Large Cap", "Semiconductors"),
+    "MSFT": ("Microsoft Corp.", "Large Cap", "Technology"),
+    "GOOGL": ("Alphabet Inc.", "Large Cap", "Technology"),
+    "AMZN": ("Amazon.com Inc.", "Large Cap", "Consumer"),
+    "META": ("Meta Platforms", "Large Cap", "Technology"),
+    "TSLA": ("Tesla Inc.", "Large Cap", "Automotive"),
+    "JPM": ("JPMorgan Chase", "Large Cap", "Finance"),
+    "V": ("Visa Inc.", "Large Cap", "Finance"),
+    "UNH": ("UnitedHealth", "Large Cap", "Healthcare"),
+    "LLY": ("Eli Lilly", "Large Cap", "Healthcare"),
+    "AVGO": ("Broadcom Inc.", "Large Cap", "Semiconductors"),
+    "SOFI": ("SoFi Technologies", "Penny/Small", "Fintech"),
+    "PLTR": ("Palantir Tech", "Penny/Small", "Software"),
+    "NIO": ("NIO Inc.", "Penny/Small", "EV"),
+    "MARA": ("MARA Holdings", "Penny/Small", "Crypto Mining"),
+    "RIOT": ("Riot Platforms", "Penny/Small", "Crypto Mining"),
+    "LCID": ("Lucid Group", "Penny/Small", "EV"),
+    "PLUG": ("Plug Power", "Penny/Small", "Clean Energy"),
+    "BB": ("BlackBerry Ltd", "Penny/Small", "Cybersecurity"),
+    "OPEN": ("Opendoor Tech", "Penny/Small", "Real Estate"),
+    "DNA": ("Ginkgo Bioworks", "Penny/Small", "Biotech"),
+    "IONQ": ("IonQ Inc.", "Penny/Small", "Quantum"),
+    "QUBT": ("Quantum Computing", "Penny/Small", "Quantum"),
+    "SOUN": ("SoundHound AI", "Penny/Small", "AI"),
+    "RGTI": ("Rigetti Computing", "Penny/Small", "Quantum"),
+    "BTBT": ("Bit Digital Inc.", "Penny/Small", "Crypto Mining"),
+    "HIMS": ("Hims & Hers", "Penny/Small", "Health"),
+    "CIFR": ("Cipher Mining", "Penny/Small", "Crypto Mining"),
+    "PSNY": ("Polestar Auto", "Penny/Small", "EV"),
+}
+
+
+# ── Refresh intervals (in seconds) ───────────────────────────────
+REFRESH_INTERVALS = {
+    "30 seconds": 30_000,
+    "1 minute": 60_000,
+    "2 minutes": 120_000,
+    "5 minutes": 300_000,
+    "15 minutes": 900_000,
+}
+
+CACHE_TTL_MAP = {
+    "30 seconds": 25,
+    "1 minute": 55,
+    "2 minutes": 110,
+    "5 minutes": 280,
+    "15 minutes": 850,
 }
 
 
 def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """
-    Split a multi-ticker yf.download() result into per-ticker DataFrames.
-    Handles both MultiIndex columns (multi-ticker) and flat columns (single-ticker).
-    """
     results = {}
     if raw_df.empty:
         return results
-
     if isinstance(raw_df.columns, pd.MultiIndex):
         available = raw_df.columns.get_level_values(1).unique().tolist()
         for t in tickers:
@@ -72,41 +104,24 @@ def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str,
     return results
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=120, show_spinner=False)
 def fetch_batch_data(tickers: tuple, period: str = "6mo") -> dict[str, pd.DataFrame]:
-    """
-    Fetch ALL tickers in a SINGLE yf.download() call.
-
-    This is the #1 performance fix: yfinance batches multiple tickers into
-    one HTTP request, cutting network time from 12×3s = 36s → ~4s total.
-    Failed tickers are retried individually via ThreadPoolExecutor.
-    """
     ticker_list = list(tickers)
-
-    # Phase 1: Batch download (single HTTP call)
     try:
         raw = yf.download(
-            " ".join(ticker_list),
-            period=period,
-            interval="1d",
-            progress=False,
-            auto_adjust=True,
-            timeout=15,
-            threads=True,
+            " ".join(ticker_list), period=period, interval="1d",
+            progress=False, auto_adjust=True, timeout=15, threads=True,
         )
         results = _split_multi_download(raw, ticker_list)
     except Exception:
         results = {}
 
-    # Phase 2: Retry failures individually (parallel threads)
     failed = [t for t in ticker_list if t not in results]
     if failed:
         def _fetch_one(ticker):
             try:
-                df = yf.download(
-                    ticker, period=period, interval="1d",
-                    progress=False, auto_adjust=True, timeout=8,
-                )
+                df = yf.download(ticker, period=period, interval="1d",
+                                 progress=False, auto_adjust=True, timeout=8)
                 if df.empty:
                     return ticker, None
                 if isinstance(df.columns, pd.MultiIndex):
@@ -116,36 +131,23 @@ def fetch_batch_data(tickers: tuple, period: str = "6mo") -> dict[str, pd.DataFr
             except Exception:
                 return ticker, None
 
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {pool.submit(_fetch_one, t): t for t in failed}
-            for future in as_completed(futures, timeout=20):
+            for future in as_completed(futures, timeout=25):
                 try:
                     t, df = future.result(timeout=10)
                     if df is not None:
                         results[t] = df
                 except Exception:
                     continue
-
     return results
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_intraday(ticker: str) -> pd.DataFrame | None:
-    """Fetch 5-minute intraday data for real-time view."""
-    try:
-        data = yf.download(
-            ticker, period="5d", interval="5m",
-            progress=False, auto_adjust=True, timeout=8,
-        )
-        if data.empty:
-            return None
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.get_level_values(0)
-        return data
-    except Exception:
-        return None
+def get_ticker_info(ticker: str) -> tuple[str, str, str]:
+    """Return (name, cap_tier, sector)."""
+    return TICKER_META.get(ticker, (ticker, "Unknown", "Unknown"))
 
 
-def get_ticker_info(ticker: str) -> tuple[str, str]:
-    """Return (name, sector) for a ticker."""
-    return TICKER_META.get(ticker, (ticker, "Unknown"))
+def is_penny_stock(ticker: str) -> bool:
+    info = TICKER_META.get(ticker)
+    return info is not None and info[1] == "Penny/Small"
