@@ -86,7 +86,6 @@ signal/
 │   └── intraday.py           # 5-min bars + VWAP + ORB detection
 ├── .streamlit/config.toml
 ├── requirements.txt
-├── runtime.txt               # python-3.12.8
 ├── packages.txt              # build-essential, python3-dev
 └── README.md
 ```
@@ -102,8 +101,13 @@ git commit -m "Initial commit"
 git push origin main
 ```
 
-Then go to **share.streamlit.io** → New App → select your repo → `app.py` → Deploy.
-Don't forget to add `FINNHUB_API_KEY` in Settings → Secrets.
+Then go to **share.streamlit.io** → **New app** → select your repo → `app.py`.
+
+**IMPORTANT: Set Python version during deployment.** Click **Advanced settings** and select **Python 3.12**. Streamlit Cloud ignores `runtime.txt` files — the Python version must be configured in the deployment UI. If you've already deployed with a wrong version, you must delete the app and redeploy.
+
+After deployment, add `FINNHUB_API_KEY` in **Settings → Secrets**.
+
+The app is coded defensively to work on Python 3.12 through 3.14, but 3.12 has the broadest library compatibility and is recommended.
 
 ---
 

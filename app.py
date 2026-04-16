@@ -194,6 +194,21 @@ def grade_color(g):
 def sentiment_color(s):
     return {"bullish":"#34C759","bearish":"#FF453A"}.get(s,"rgba(255,255,255,0.3)")
 
+def to_1d(df, col):
+    """
+    Return a strictly 1-D numpy array for a DataFrame column.
+    Handles cases where yfinance returns MultiIndex columns that get
+    flattened into duplicated column names, producing 2-D data.
+    Required for plotly.graph_objects.Candlestick on Python 3.14+.
+    """
+    s = df[col]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    arr = np.asarray(s).astype(float)
+    if arr.ndim > 1:
+        arr = arr.ravel()
+    return arr
+
 # ─── Header ──────────────────────────────────────────────────────
 h1, h2 = st.columns([3, 1])
 with h1:
@@ -561,10 +576,10 @@ with tab_intraday:
                         fig = go.Figure()
                         fig.add_trace(go.Candlestick(
                             x=today.index,
-                            open=today["Open"].values.flatten(),
-                            high=today["High"].values.flatten(),
-                            low=today["Low"].values.flatten(),
-                            close=today["Close"].values.flatten(),
+                            open=to_1d(today, "Open"),
+                            high=to_1d(today, "High"),
+                            low=to_1d(today, "Low"),
+                            close=to_1d(today, "Close"),
                             increasing_line_color="#34C759",
                             decreasing_line_color="#FF453A",
                             increasing_fillcolor="#34C75930",
@@ -572,7 +587,7 @@ with tab_intraday:
                             name="Price",
                         ))
                         fig.add_trace(go.Scatter(
-                            x=today.index, y=today["vwap"].values.flatten(),
+                            x=today.index, y=to_1d(today, "vwap"),
                             mode="lines", line=dict(color="#0A84FF", width=1.5, dash="dot"),
                             name="VWAP", hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
                         ))
@@ -620,9 +635,20 @@ with tab_detail:
             df = data_dict.get(sel)
             if df is not None:
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
-                fig.add_trace(go.Candlestick(x=df.index, open=df["Open"].values.flatten(), high=df["High"].values.flatten(), low=df["Low"].values.flatten(), close=df["Close"].values.flatten(), increasing_line_color="#34C759", decreasing_line_color="#FF453A", increasing_fillcolor="#34C75930", decreasing_fillcolor="#FF453A30"), row=1, col=1)
-                vc = ["#34C759" if c >= o else "#FF453A" for c, o in zip(df["Close"].values.flatten(), df["Open"].values.flatten())]
-                fig.add_trace(go.Bar(x=df.index, y=df["Volume"].values.flatten(), marker_color=vc, opacity=0.4), row=2, col=1)
+                fig.add_trace(go.Candlestick(
+                    x=df.index,
+                    open=to_1d(df, "Open"),
+                    high=to_1d(df, "High"),
+                    low=to_1d(df, "Low"),
+                    close=to_1d(df, "Close"),
+                    increasing_line_color="#34C759", decreasing_line_color="#FF453A",
+                    increasing_fillcolor="#34C75930", decreasing_fillcolor="#FF453A30",
+                ), row=1, col=1)
+                close_arr = to_1d(df, "Close")
+                open_arr = to_1d(df, "Open")
+                vol_arr = to_1d(df, "Volume")
+                vc = ["#34C759" if c >= o else "#FF453A" for c, o in zip(close_arr, open_arr)]
+                fig.add_trace(go.Bar(x=df.index, y=vol_arr, marker_color=vc, opacity=0.4), row=2, col=1)
                 fig.update_layout(**PLOTLY_LAYOUT, height=420, showlegend=False, xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"detail_{sel}")
 

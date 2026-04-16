@@ -80,6 +80,16 @@ CACHE_TTL_MAP = {
 }
 
 
+def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure DataFrame has flat, unique column names and 1-D columns."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    # Deduplicate any accidental column repeats
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
+
 def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
     results = {}
     if raw_df.empty:
@@ -90,6 +100,7 @@ def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str,
             if t in available:
                 try:
                     tdf = raw_df.xs(t, level=1, axis=1).copy()
+                    tdf = _clean_cols(tdf)
                     tdf.dropna(subset=["Close"], inplace=True)
                     if len(tdf) > 60:
                         results[t] = tdf
@@ -97,7 +108,7 @@ def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str,
                     continue
     else:
         if len(tickers) == 1 and len(raw_df) > 60:
-            df = raw_df.copy()
+            df = _clean_cols(raw_df.copy())
             df.dropna(subset=["Close"], inplace=True)
             if len(df) > 60:
                 results[tickers[0]] = df
@@ -124,8 +135,7 @@ def fetch_batch_data(tickers: tuple, period: str = "6mo") -> dict[str, pd.DataFr
                                  progress=False, auto_adjust=True, timeout=8)
                 if df.empty:
                     return ticker, None
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
+                df = _clean_cols(df)
                 df.dropna(subset=["Close"], inplace=True)
                 return (ticker, df) if len(df) > 60 else (ticker, None)
             except Exception:

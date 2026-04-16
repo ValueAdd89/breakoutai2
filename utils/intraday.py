@@ -46,6 +46,9 @@ def fetch_intraday_5m(ticker: str, days: int = 5) -> pd.DataFrame | None:
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
+        # Deduplicate any repeated column names to prevent 2-D column access
+        if df.columns.duplicated().any():
+            df = df.loc[:, ~df.columns.duplicated()]
         df.dropna(subset=["Close"], inplace=True)
         return df if len(df) > 10 else None
     except Exception:
