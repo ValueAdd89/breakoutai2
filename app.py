@@ -316,9 +316,9 @@ c5.metric("High Probability", f"{top_pro}", delta="Score ≥ 100" if pro_scores 
 st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
 
 # ─── Tabs ─────────────────────────────────────────────────────────
-tab_overview, tab_breakout, tab_intraday, tab_detail, tab_options, tab_heatmap = st.tabs([
-    "◉ Overview", "🔥 Breakout Scanner", "⚡ Intraday (5m)",
-    "◎ Detail", "⬡ Options", "◈ Heatmap",
+tab_overview, tab_breakout, tab_penny, tab_intraday, tab_detail, tab_options, tab_heatmap = st.tabs([
+    "◉ Overview", "🔥 Breakout Scanner", "🎰 Penny Intel",
+    "⚡ Intraday (5m)", "◎ Detail", "⬡ Options", "◈ Heatmap",
 ])
 
 # ═══ TAB 1: OVERVIEW ═══
@@ -504,19 +504,305 @@ with tab_breakout:
                                 f'<div class="news-meta">{n.source} · {n.datetime_utc.strftime("%Y-%m-%d %H:%M UTC")}</div>'
                                 f'</div>', unsafe_allow_html=True)
 
-# ═══ TAB 3: INTRADAY (5m) ═══
+# ═══ TAB 3: PENNY INTEL ═══
+with tab_penny:
+    if not signals:
+        st.info("No data available.")
+    else:
+        penny_sigs = {t: s for t, s in signals.items() if is_penny_stock(t)}
+        if not penny_sigs:
+            st.warning("No penny stocks in current watchlist. Select 'All' or 'Penny/Small Cap Only' in the sidebar.")
+        else:
+            mkt_open = is_market_hours()
+            if mkt_open:
+                header_text = "Live Market · Penny Stock Intelligence"
+                sub_text = "Real-time penny stock analysis with news catalysts, float structure, and breakout signals."
+            else:
+                header_text = "After-Hours · Penny Stock Overnight Scanner"
+                sub_text = (
+                    "Market is closed. Scanning for overnight catalysts, pre-market gap setups, and next-session opportunities. "
+                    "Professional traders do their best research after hours — this is when you find tomorrow's runners."
+                )
+
+            st.markdown(f'<p class="section-label">{header_text}</p>', unsafe_allow_html=True)
+            st.markdown(f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">{sub_text}</div>', unsafe_allow_html=True)
+
+            # Sort: by pro score if available, else breakout score
+            def penny_sort_key(t):
+                if t in pro_scores:
+                    return pro_scores[t].total_score
+                return penny_sigs[t].breakout_score
+
+            sorted_pennies = sorted(penny_sigs.keys(), key=penny_sort_key, reverse=True)
+
+            # ── Summary cards row ─────────────────────────────
+            pc1, pc2, pc3, pc4 = st.columns(4)
+            penny_bull = sum(1 for s in penny_sigs.values() if s.direction == "bullish")
+            penny_squeeze = sum(1 for s in penny_sigs.values() if s.squeeze_on)
+            penny_high_rvol = sum(1 for s in penny_sigs.values() if s.rvol_5 > 1.5)
+            top_penny = sorted_pennies[0] if sorted_pennies else "—"
+            pc1.metric("Penny Bullish", f"{penny_bull}/{len(penny_sigs)}")
+            pc2.metric("Squeezes Active", penny_squeeze)
+            pc3.metric("High RVol (>1.5x)", penny_high_rvol)
+            pc4.metric("Top Pick", top_penny)
+
+            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+
+            # ── Per-ticker deep dive cards ────────────────────
+            for t in sorted_pennies:
+                sig = penny_sigs[t]
+                pro = pro_scores.get(t)
+                profile = profiles.get(t)
+                news = news_by_ticker.get(t, [])
+                intra = intraday_stats_dict.get(t)
+                name, tier, sector = get_ticker_info(t)
+                clr = color_for(sig.direction)
+                grade = pro.total_grade if pro else sig.breakout_grade
+                score = pro.total_score if pro else sig.breakout_score
+                max_s = 150 if pro else 100
+                gc = grade_color(grade)
+
+                with st.container(border=True):
+                    # ── Header ────────────────────────────────
+                    hc1, hc2 = st.columns([4, 1])
+                    with hc1:
+                        float_text = ""
+                        short_text = ""
+                        if profile:
+                            if profile.float_shares_m > 0:
+                                float_text = f" · Float: {profile.float_shares_m:.1f}M"
+                            if profile.short_pct_float > 0:
+                                short_text = f" · Short: {profile.short_pct_float:.1f}%"
+                        st.markdown(
+                            f'<div style="display:flex; align-items:center; gap:14px;">'
+                            f'<span class="grade-badge" style="background:{gc}20; color:{gc}; border:2px solid {gc}40;">{grade}</span>'
+                            f'<div>'
+                            f'<span style="font-family:\'DM Sans\'; font-size:22px; font-weight:700; color:#F5F5F7;">{t}</span>'
+                            f'<span style="font-size:13px; color:rgba(255,255,255,0.35); margin-left:10px;">{name} · {sector}{float_text}{short_text}</span>'
+                            f'<div style="display:flex; gap:6px; margin-top:4px; flex-wrap:wrap;">'
+                            f'<span class="badge-{sig.direction}">{icon_for(sig.direction)} {sig.direction.title()}</span>'
+                            + (f'<span class="play-type-badge" style="background:rgba(191,90,242,0.15); color:#BF5AF2;">🔥 Squeeze</span>' if sig.squeeze_on else '')
+                            + (f'<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">📈 High RVol</span>' if sig.rvol_5 > 1.5 else '')
+                            + (f'<span class="play-type-badge" style="background:rgba(255,159,10,0.15); color:#FF9F0A;">⚠ Overbought</span>' if sig.rsi > 70 else '')
+                            + (f'<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">💰 Oversold</span>' if sig.rsi < 30 else '')
+                            + f'</div></div></div>', unsafe_allow_html=True)
+                    with hc2:
+                        st.markdown(
+                            f'<div style="text-align:right;">'
+                            f'<div class="mono" style="font-size:26px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</div>'
+                            f'<div class="mono" style="font-size:13px; color:{"#34C759" if sig.change_1d >= 0 else "#FF453A"};">{sig.change_1d:+.2f}% (1D)</div>'
+                            f'<div class="mono" style="font-size:11px; color:rgba(255,255,255,0.3);">{sig.change_5d:+.2f}% (5D)</div>'
+                            f'</div>', unsafe_allow_html=True)
+
+                    # ── Key Metrics Grid ──────────────────────
+                    st.markdown(
+                        f'<div style="display:flex; gap:16px; margin:14px 0; font-family:\'JetBrains Mono\'; font-size:12px; flex-wrap:wrap;">'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol(5d)</span> <span style="color:{"#34C759" if sig.rvol_5>1.5 else "#F5F5F7"}; font-weight:{"700" if sig.rvol_5>2 else "400"};">{sig.rvol_5:.1f}x</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol(20d)</span> <span style="color:#F5F5F7;">{sig.rvol_20:.1f}x</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">RSI</span> <span style="color:#F5F5F7;">{sig.rsi:.0f}</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Squeeze</span> <span style="color:{"#BF5AF2" if sig.squeeze_on else "rgba(255,255,255,0.3)"};">{"YES" if sig.squeeze_on else "No"}</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Range(10d)</span> <span style="color:#F5F5F7;">{sig.range_compression:.1f}%</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">From High</span> <span style="color:#F5F5F7;">{sig.pct_from_high:+.1f}%</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Gap</span> <span style="color:{"#34C759" if sig.gap_pct > 1 else "#FF453A" if sig.gap_pct < -1 else "#F5F5F7"};">{sig.gap_pct:+.1f}%</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Consec Up</span> <span style="color:#F5F5F7;">{sig.consec_up}d</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Conf</span> <span style="color:{clr};">{sig.confidence}%</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Acc</span> <span style="color:#F5F5F7;">{sig.accuracy}%</span></div>'
+                        f'</div>', unsafe_allow_html=True)
+
+                    # ── Float & Short Profile ─────────────────
+                    if profile and (profile.float_shares_m > 0 or profile.short_pct_float > 0 or profile.market_cap_m > 0):
+                        pro_p = pro_scores.get(t)
+                        float_tier = pro_p.float_tier if pro_p else "Unknown"
+                        turnover = pro_p.turnover_pct if pro_p else 0
+
+                        st.markdown('<p class="section-label">Float & Short Profile</p>', unsafe_allow_html=True)
+                        ft_color = "#FF453A" if float_tier in ("Micro Float",) else "#FFD60A" if float_tier == "Low Float" else "#F5F5F7"
+                        st.markdown(
+                            f'<div class="kv-grid">'
+                            f'<div class="kv-cell"><div class="kv-label">Float</div><div class="kv-value" style="color:{ft_color};">{profile.float_shares_m:.1f}M</div><div class="kv-sub">{float_tier}</div></div>'
+                            f'<div class="kv-cell"><div class="kv-label">Market Cap</div><div class="kv-value">${profile.market_cap_m:,.0f}M</div></div>'
+                            f'<div class="kv-cell"><div class="kv-label">Short % Float</div><div class="kv-value" style="color:{"#FF453A" if profile.short_pct_float > 15 else "#F5F5F7"};">{profile.short_pct_float:.1f}%</div><div class="kv-sub">{"⚠ Squeeze risk" if profile.short_pct_float > 20 else "Short ratio: " + str(profile.short_ratio)}</div></div>'
+                            f'</div>', unsafe_allow_html=True)
+
+                        if turnover > 0:
+                            tv_color = "#FF453A" if turnover > 50 else "#34C759" if turnover > 10 else "#F5F5F7"
+                            st.markdown(
+                                f'<div style="margin-top:8px; padding:10px 14px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px;">'
+                                f'<span style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.4);">Float Turnover Today: </span>'
+                                f'<span class="mono" style="font-size:14px; font-weight:700; color:{tv_color};">{turnover:.1f}%</span>'
+                                f'<span style="font-family:\'DM Sans\'; font-size:11px; color:rgba(255,255,255,0.25); margin-left:8px;">'
+                                f'{"— Entire float rotated!" if turnover >= 100 else "— Heavy institutional rotation" if turnover >= 50 else "— Strong participation" if turnover >= 25 else "— Normal activity"}'
+                                f'</span></div>', unsafe_allow_html=True)
+
+                    # ── Intraday Snapshot (works after hours too — shows last session) ──
+                    if intra:
+                        vw_c = "#34C759" if intra.above_vwap else "#FF453A"
+                        session_label = "Today's Session" if mkt_open else "Last Session"
+                        st.markdown(f'<p class="section-label">{session_label} · Intraday Structure</p>', unsafe_allow_html=True)
+                        flags_html = ""
+                        if intra.above_vwap:
+                            flags_html += '<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">▲ Above VWAP</span> '
+                        else:
+                            flags_html += '<span class="play-type-badge" style="background:rgba(255,69,58,0.15); color:#FF453A;">▼ Below VWAP</span> '
+                        if intra.opening_range_break:
+                            flags_html += '<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">ORB Break</span> '
+                        if intra.breakout_of_day:
+                            flags_html += '<span class="play-type-badge" style="background:rgba(191,90,242,0.15); color:#BF5AF2;">New Day High</span> '
+                        st.markdown(
+                            f'<div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">'
+                            f'{flags_html}'
+                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">VWAP: <span style="color:{vw_c};">${intra.vwap:.2f}</span></span>'
+                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">Intraday: <span style="color:{"#34C759" if intra.day_change_pct >= 0 else "#FF453A"};">{intra.day_change_pct:+.2f}%</span></span>'
+                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">Vol vs Avg: {intra.volume_vs_avg:.2f}x</span>'
+                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">AM Range: {intra.morning_range_pct:.1f}%</span>'
+                            f'</div>', unsafe_allow_html=True)
+
+                    # ── After-Hours Setup Score (shows when market closed) ──
+                    if not mkt_open:
+                        st.markdown('<p class="section-label">Overnight Setup Analysis</p>', unsafe_allow_html=True)
+                        setup_pts = 0
+                        setup_notes = []
+
+                        # Technical setup quality
+                        if sig.squeeze_on:
+                            setup_pts += 30
+                            setup_notes.append(("Squeeze Loaded", "BB inside Keltner — volatility expansion imminent at open. This is the #1 overnight setup for gap-ups.", "#BF5AF2"))
+                        if sig.rvol_5 > 1.5:
+                            setup_pts += 20
+                            setup_notes.append(("Volume Building", f"RVol(5d) at {sig.rvol_5:.1f}x — institutional accumulation happened recently. Watch for continuation.", "#34C759"))
+                        if -3 < sig.pct_from_high < 0:
+                            setup_pts += 15
+                            setup_notes.append(("Near Breakout Level", f"Only {abs(sig.pct_from_high):.1f}% from high — any catalyst could trigger a breakout at open.", "#FFD60A"))
+                        if sig.rsi > 40 and sig.rsi < 65:
+                            setup_pts += 10
+                            setup_notes.append(("RSI Sweet Spot", f"RSI at {sig.rsi:.0f} — room to run without being overbought.", "#34C759"))
+                        if sig.direction == "bullish" and sig.confidence > 60:
+                            setup_pts += 15
+                            setup_notes.append(("Model Bullish", f"Ensemble predicts bullish with {sig.confidence}% confidence.", "#0A84FF"))
+
+                        # News catalyst overnight
+                        if news:
+                            bull_news = [n for n in news if n.sentiment == "bullish" and n.importance >= 2]
+                            if bull_news:
+                                setup_pts += 25
+                                setup_notes.append(("Overnight Catalyst", f"{len(bull_news)} high-importance bullish news item(s) — potential gap-up trigger.", "#FF453A"))
+                            elif any(n.sentiment == "bullish" for n in news):
+                                setup_pts += 10
+                                setup_notes.append(("Positive News Flow", "Recent bullish headlines could attract pre-market buyers.", "#34C759"))
+
+                        if profile and profile.short_pct_float > 15:
+                            setup_pts += 10
+                            setup_notes.append(("Short Squeeze Setup", f"{profile.short_pct_float:.1f}% short — any positive catalyst could trigger short covering at open.", "#FF453A"))
+
+                        setup_pts = min(100, setup_pts)
+                        setup_grade = "A+" if setup_pts >= 85 else "A" if setup_pts >= 70 else "B" if setup_pts >= 55 else "C" if setup_pts >= 40 else "D" if setup_pts >= 25 else "F"
+                        sgc = grade_color(setup_grade)
+
+                        st.markdown(
+                            f'<div style="display:flex; gap:16px; align-items:center; margin-bottom:14px;">'
+                            f'<span class="grade-badge" style="background:{sgc}20; color:{sgc}; border:2px solid {sgc}40; width:52px; height:52px; font-size:18px;">{setup_grade}</span>'
+                            f'<div>'
+                            f'<div class="mono" style="font-size:20px; font-weight:700; color:{sgc};">Overnight Setup: {setup_pts}/100</div>'
+                            f'<div style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.4);">{"Strong setup — add to pre-market watchlist" if setup_pts >= 60 else "Moderate — monitor for catalyst" if setup_pts >= 35 else "Weak setup — wait for better entry"}</div>'
+                            f'</div></div>', unsafe_allow_html=True)
+
+                        for note_name, note_desc, note_color in setup_notes:
+                            st.markdown(
+                                f'<div class="driver-row">'
+                                f'<span class="driver-tag" style="background:{note_color}20; color:{note_color};">{note_name}</span>'
+                                f'<span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5;">{note_desc}</span>'
+                                f'</div>', unsafe_allow_html=True)
+
+                        if not setup_notes:
+                            st.markdown('<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.35);">No strong overnight signals detected. Check back closer to pre-market (4 AM ET).</div>', unsafe_allow_html=True)
+
+                    # ── Breakout Factor Breakdown ─────────────
+                    st.markdown('<p class="section-label">Breakout Factor Breakdown</p>', unsafe_allow_html=True)
+                    impact_colors = {
+                        "critical":("#FF453A","rgba(255,69,58,0.15)"), "strong":("#34C759","rgba(52,199,89,0.12)"),
+                        "moderate":("#FFD60A","rgba(255,214,10,0.12)"), "weak":("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"),
+                        "negative":("#FF6961","rgba(255,105,97,0.10)"), "neutral":("rgba(255,255,255,0.3)","rgba(255,255,255,0.04)"),
+                        "signal":("#BF5AF2","rgba(191,90,242,0.12)"),
+                    }
+                    all_factors = list(sig.breakout_factors)
+                    if pro:
+                        all_factors.extend(pro.pro_factors)
+                    for factor, desc, impact in all_factors:
+                        ic, ib = impact_colors.get(impact, ("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"))
+                        st.markdown(f'<div class="driver-row"><span class="driver-tag" style="background:{ib}; color:{ic};">{factor}</span><span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5;">{desc}</span></div>', unsafe_allow_html=True)
+
+                    # ── News Feed ─────────────────────────────
+                    if news:
+                        st.markdown('<p class="section-label">Recent News & Catalysts</p>', unsafe_allow_html=True)
+                        for n in news[:5]:
+                            sent_c = sentiment_color(n.sentiment)
+                            imp_txt = "●" * max(1, n.importance)
+                            age_hrs = (datetime.utcnow() - n.datetime_utc).total_seconds() / 3600
+                            age_text = f"{age_hrs:.0f}h ago" if age_hrs < 48 else f"{age_hrs/24:.0f}d ago"
+                            freshness = "🔴 FRESH" if age_hrs < 6 else "🟡 Recent" if age_hrs < 24 else ""
+                            link = f' · <a href="{n.url}" target="_blank" style="color:rgba(255,255,255,0.3); text-decoration:none; font-size:10px;">↗ open</a>' if n.url else ""
+                            freshness_html = f' <span class="imp-badge" style="background:rgba(255,69,58,0.2); color:#FF453A;">{freshness}</span>' if freshness else ""
+                            st.markdown(
+                                f'<div class="news-item {n.sentiment}">'
+                                f'<div class="news-headline">'
+                                f'<span class="imp-badge" style="background:{sent_c}20; color:{sent_c};">{imp_txt} {n.sentiment}</span>'
+                                f'{freshness_html}'
+                                f' {n.headline}</div>'
+                                f'<div class="news-meta">{n.source} · {age_text}{link}</div>'
+                                f'</div>', unsafe_allow_html=True)
+                    elif FINNHUB_KEY_PRESENT:
+                        st.caption("No recent news for this ticker.")
+                    else:
+                        st.caption("⚠ Set FINNHUB_API_KEY in secrets to enable news feed.")
+
+                    # ── Active Technical Signals ──────────────
+                    st.markdown('<p class="section-label">Active Technical Signals</p>', unsafe_allow_html=True)
+                    for s_text in sig.signals:
+                        st.markdown(f'<div class="sig-item"><span class="sig-dot" style="background:{clr}; box-shadow:0 0 6px {clr}60;"></span>{s_text}</div>', unsafe_allow_html=True)
+
+            # ── Penny Watchlist Summary Table ─────────────────
+            st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
+            st.markdown('<p class="section-label">Penny Stock Summary Table</p>', unsafe_allow_html=True)
+            penny_table = []
+            for t in sorted_pennies:
+                s = penny_sigs[t]
+                pr = pro_scores.get(t)
+                pf = profiles.get(t)
+                nw = news_by_ticker.get(t, [])
+                bull_news_count = sum(1 for n in nw if n.sentiment == "bullish") if nw else 0
+                penny_table.append({
+                    "Ticker": t,
+                    "Price": f"${s.price:,.2f}",
+                    "1D %": f"{s.change_1d:+.2f}%",
+                    "5D %": f"{s.change_5d:+.2f}%",
+                    "Dir": s.direction.title(),
+                    "RVol": f"{s.rvol_5:.1f}x",
+                    "Squeeze": "🔥" if s.squeeze_on else "—",
+                    "Float": f"{pf.float_shares_m:.0f}M" if pf and pf.float_shares_m > 0 else "—",
+                    "Short%": f"{pf.short_pct_float:.1f}%" if pf and pf.short_pct_float > 0 else "—",
+                    "News": f"{bull_news_count}↑" if bull_news_count > 0 else "—",
+                    "Score": f"{pr.total_score:.0f}" if pr else f"{s.breakout_score:.0f}",
+                    "Grade": pr.total_grade if pr else s.breakout_grade,
+                    "RSI": f"{s.rsi:.0f}",
+                    "Conf": f"{s.confidence}%",
+                })
+            st.dataframe(pd.DataFrame(penny_table), use_container_width=True, hide_index=True, height=min(500, 40 + len(penny_table) * 38))
+
+
+# ═══ TAB 4: INTRADAY (5m) ═══
 with tab_intraday:
     if not enable_intraday:
         st.info("Intraday data is disabled in the sidebar.")
     elif not intraday_stats_dict:
-        st.warning("No intraday data available. Market may be closed, or data is still loading.")
+        st.warning("No intraday data loaded. This may mean yfinance returned no 5-minute bars — try refreshing.")
     else:
-        st.markdown('<p class="section-label">5-Minute Intraday Scanner · Today\'s Session</p>', unsafe_allow_html=True)
+        mkt_status = "Live Session" if is_market_hours() else "Last Session (Market Closed)"
+        mkt_note = "" if is_market_hours() else " · Showing most recent trading session data. Signals remain valid for pre-market preparation."
+        st.markdown(f'<p class="section-label">5-Minute Intraday Scanner · {mkt_status}</p>', unsafe_allow_html=True)
         st.markdown(
-            '<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">'
-            'Real-time intraday structure — VWAP, opening range breakouts, and new-day-high detection. '
-            'Data refreshes with your selected interval. Sorted by intraday % gain.'
-            '</div>', unsafe_allow_html=True)
+            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">'
+            f'VWAP, opening range breakouts, and new-day-high detection. Sorted by % change.{mkt_note}'
+            f'</div>', unsafe_allow_html=True)
 
         # Sort by intraday move
         sorted_stats = sorted(intraday_stats_dict.items(), key=lambda x: x[1].day_change_pct, reverse=True)
@@ -611,7 +897,7 @@ with tab_intraday:
                         )
                         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"intraday_{t}")
 
-# ═══ TAB 4: DETAIL VIEW ═══
+# ═══ TAB 5: DETAIL VIEW ═══
 with tab_detail:
     if not signals:
         st.info("No signals.")
@@ -699,7 +985,7 @@ with tab_detail:
         else:
             st.caption("⚠ Add a FINNHUB_API_KEY in Streamlit secrets to enable news feed.")
 
-# ═══ TAB 5: OPTIONS PLAYS ═══
+# ═══ TAB 6: OPTIONS PLAYS ═══
 with tab_options:
     if not signals:
         st.info("No signals.")
@@ -815,7 +1101,7 @@ with tab_options:
                     st.markdown(f'<div class="risk-item"><span style="color:#FF9F0A;">⚠</span>{r}</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-# ═══ TAB 6: HEATMAP ═══
+# ═══ TAB 7: HEATMAP ═══
 with tab_heatmap:
     if not signals:
         st.info("No data.")
