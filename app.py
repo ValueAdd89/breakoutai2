@@ -1,19 +1,8 @@
 """
 Signal — Professional Trading Analytics (Pro Edition)
 ======================================================
-Data sources:
-  • yfinance         — daily OHLCV, intraday 5-min bars, float/short data
-  • Finnhub (free)   — news, company profile, earnings calendar
-                       Set FINNHUB_API_KEY in Streamlit secrets for news/catalysts
-
-Features:
-  • Configurable auto-refresh (30s / 1m / 2m / 5m / 15m)
-  • Daily breakout scanner with 6-factor composite scoring (100 pts base)
-  • Pro-grade scoring layer adding float, short interest, news catalysts, intraday (50 pts bonus)
-  • 5-minute intraday scanner with VWAP, Opening Range Breakouts, new-day-highs
-  • News feed with sentiment & importance tagging
-  • Options plays with 90% CI and Black-Scholes pricing
-  • All operations parallelized; single batch data fetch
+Rebuilt with card-based grid layout, always-on data (no market-hours gating),
+runner pattern detection for penny stocks, and visual polish.
 """
 
 import sys, os
@@ -39,151 +28,98 @@ from utils.data import (
     DEFAULT_TICKERS, LARGE_CAP_TICKERS, PENNY_TICKERS,
     REFRESH_INTERVALS, CACHE_TTL_MAP,
 )
-from utils.catalysts import (
-    fetch_news, fetch_company_profile, fetch_earnings_calendar,
-    _get_api_key,
-)
-from utils.intraday import (
-    fetch_intraday_batch, compute_intraday_stats, is_market_hours,
-)
+from utils.catalysts import fetch_news, fetch_company_profile, _get_api_key
+from utils.intraday import fetch_intraday_batch, compute_intraday_stats, is_market_hours
 from models.predictor import predict_batch_parallel, Signal
 from models.pro_scorer import compute_pro_breakout
 from models.options_engine import generate_options_plays
 
-st.set_page_config(page_title="Signal — Pro Analytics", page_icon="◉", layout="wide", initial_sidebar_state="collapsed")
-
+st.set_page_config(page_title="Signal Pro", page_icon="◉", layout="wide", initial_sidebar_state="collapsed")
 FINNHUB_KEY_PRESENT = bool(_get_api_key())
 
 # ─── Sidebar ─────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ◉ Signal Config")
     st.markdown("---")
-    refresh_choice = st.selectbox("⏱ Refresh Interval", list(REFRESH_INTERVALS.keys()), index=2)
+    refresh_choice = st.selectbox("⏱ Refresh", list(REFRESH_INTERVALS.keys()), index=2)
     st.markdown("---")
-    ticker_mode = st.radio("Watchlist", ["All (Large + Penny)", "Large Cap Only", "Penny / Small Cap Only", "Custom"])
-    if ticker_mode == "All (Large + Penny)":
-        selected_tickers = DEFAULT_TICKERS
-    elif ticker_mode == "Large Cap Only":
-        selected_tickers = LARGE_CAP_TICKERS
-    elif ticker_mode == "Penny / Small Cap Only":
-        selected_tickers = PENNY_TICKERS
+    ticker_mode = st.radio("Watchlist", ["All", "Large Cap", "Penny/Small", "Custom"])
+    if ticker_mode == "All": selected_tickers = DEFAULT_TICKERS
+    elif ticker_mode == "Large Cap": selected_tickers = LARGE_CAP_TICKERS
+    elif ticker_mode == "Penny/Small": selected_tickers = PENNY_TICKERS
+    else: selected_tickers = st.multiselect("Custom", options=DEFAULT_TICKERS, default=DEFAULT_TICKERS[:8])
+    st.markdown("---")
+    lookback = st.selectbox("Lookback", ["3mo", "6mo", "1y", "2y"], index=1)
+    enable_pro = st.checkbox("Pro Scoring", value=True)
+    enable_intraday = st.checkbox("Intraday Data", value=True)
+    st.markdown("---")
+    if FINNHUB_KEY_PRESENT: st.success("✓ Finnhub connected")
     else:
-        selected_tickers = st.multiselect("Custom Tickers", options=DEFAULT_TICKERS, default=DEFAULT_TICKERS[:8])
-    st.markdown("---")
-    lookback = st.selectbox("Lookback (Daily)", ["3mo", "6mo", "1y", "2y"], index=1)
-
-    st.markdown("---")
-    enable_pro = st.checkbox("Enable Pro Scoring", value=True, help="Adds float, short interest, news catalysts, and intraday structure to breakout scoring. Uses more API calls.")
-    enable_intraday = st.checkbox("Enable Intraday Data", value=True, help="Fetches 5-minute bars for the current session")
-
-    st.markdown("---")
-    if FINNHUB_KEY_PRESENT:
-        st.success("✓ Finnhub API connected")
-    else:
-        st.warning("⚠ No Finnhub API key")
-        with st.expander("Setup news + profile data"):
-            st.markdown("""
-            1. Get a free key at **finnhub.io** (60 req/min)
-            2. On Streamlit Cloud: Settings → Secrets, add:
-            ```
-            FINNHUB_API_KEY = "your-key"
-            ```
-            3. Or locally: `export FINNHUB_API_KEY=your-key`
-            """)
-
-    st.markdown("---")
-    st.markdown("""
-    **Scoring System**
-
-    **Base (0-100)** — technical:
-    - Volume (25), Squeeze (20)
-    - Momentum (15), Accumulation (15)
-    - Key Levels (10), Model (15)
-
-    **Pro (0-50)** — trader data:
-    - Float Tier (15)
-    - Float Turnover (10)
-    - Short Squeeze (10)
-    - News Catalysts (10)
-    - Intraday Structure (5)
-
-    **Total: 0-150**
-    """)
+        st.warning("⚠ No Finnhub key")
+        with st.expander("Setup"):
+            st.markdown("Get free key at **finnhub.io** → add `FINNHUB_API_KEY` in Streamlit secrets")
 
 if HAS_AUTOREFRESH:
     st_autorefresh(interval=REFRESH_INTERVALS[refresh_choice], limit=None, key="data_refresh")
 
 # ─── CSS ─────────────────────────────────────────────────────────
-st.markdown("""
-<style>
+st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
-:root { --bg-card: rgba(255,255,255,0.03); --border: rgba(255,255,255,0.06); --text-primary: #F5F5F7; --text-secondary: rgba(255,255,255,0.45); --text-tertiary: rgba(255,255,255,0.25); --font-display: 'DM Sans'; --font-mono: 'JetBrains Mono'; }
+:root { --bg-card: rgba(255,255,255,0.03); --border: rgba(255,255,255,0.06); --text-primary: #F5F5F7; --text-secondary: rgba(255,255,255,0.45); --text-muted: rgba(255,255,255,0.25); --green: #34C759; --red: #FF453A; --yellow: #FFD60A; --blue: #0A84FF; --purple: #BF5AF2; }
 .stApp { background: linear-gradient(180deg, #000 0%, #070710 50%, #0d0d15 100%) !important; }
 #MainMenu, footer, header, .stDeployButton, div[data-testid="stToolbar"], div[data-testid="stDecoration"] { display: none !important; }
 section[data-testid="stSidebar"] { background: #08080e !important; border-right: 1px solid var(--border) !important; }
 div[data-testid="stMetric"] { background: var(--bg-card) !important; border: 1px solid var(--border) !important; border-radius: 14px !important; padding: 16px 18px !important; }
-div[data-testid="stMetric"] label { font-family: 'DM Sans' !important; font-size: 11px !important; text-transform: uppercase !important; letter-spacing: 0.08em !important; color: var(--text-tertiary) !important; }
+div[data-testid="stMetric"] label { font-family: 'DM Sans' !important; font-size: 11px !important; text-transform: uppercase !important; letter-spacing: 0.08em !important; color: var(--text-muted) !important; }
 div[data-testid="stMetric"] div[data-testid="stMetricValue"] { font-family: 'JetBrains Mono' !important; font-weight: 600 !important; font-size: 22px !important; }
 div[data-testid="stHorizontalBlock"] > div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 16px !important; border: 1px solid var(--border) !important; background: var(--bg-card) !important; }
 .stTabs [data-baseweb="tab-list"] { gap: 4px !important; border-bottom: 1px solid var(--border) !important; }
 .stTabs [data-baseweb="tab"] { font-family: 'DM Sans' !important; font-size: 14px !important; font-weight: 500 !important; color: var(--text-secondary) !important; border-radius: 8px 8px 0 0 !important; padding: 10px 18px !important; }
 .stTabs [aria-selected="true"] { color: var(--text-primary) !important; background: var(--bg-card) !important; }
 div[data-baseweb="select"] > div { background: var(--bg-card) !important; border: 1px solid var(--border) !important; border-radius: 10px !important; }
-.sig-h { font-family: 'DM Sans'; font-size: 38px; font-weight: 700; letter-spacing: -0.03em; color: #F5F5F7; margin: 0; }
-.sig-sub { font-family: 'DM Sans'; font-size: 13px; color: rgba(255,255,255,0.3); letter-spacing: 0.1em; text-transform: uppercase; margin-top: 4px; }
-.badge-bullish { display:inline-block; background:rgba(52,199,89,0.12); color:#34C759; padding:4px 12px; border-radius:20px; font-family:'DM Sans'; font-size:12px; font-weight:600; }
-.badge-bearish { display:inline-block; background:rgba(255,69,58,0.12); color:#FF453A; padding:4px 12px; border-radius:20px; font-family:'DM Sans'; font-size:12px; font-weight:600; }
-.badge-neutral { display:inline-block; background:rgba(255,214,10,0.12); color:#FFD60A; padding:4px 12px; border-radius:20px; font-family:'DM Sans'; font-size:12px; font-weight:600; }
-.sig-item { display:flex; align-items:center; gap:10px; padding:8px 0; font-family:'DM Sans'; font-size:14px; color:rgba(255,255,255,0.65); border-bottom:1px solid rgba(255,255,255,0.04); }
-.sig-dot { width:6px; height:6px; border-radius:50%; flex-shrink:0; }
-.mono { font-family: 'JetBrains Mono' !important; }
+.sig-h { font-family:'DM Sans'; font-size:38px; font-weight:700; letter-spacing:-0.03em; color:#F5F5F7; margin:0; }
+.sig-sub { font-family:'DM Sans'; font-size:13px; color:rgba(255,255,255,0.3); letter-spacing:0.1em; text-transform:uppercase; margin-top:4px; }
+.badge { display:inline-block; padding:3px 10px; border-radius:20px; font-family:'DM Sans'; font-size:11px; font-weight:600; }
+.badge-bull { background:rgba(52,199,89,0.12); color:#34C759; }
+.badge-bear { background:rgba(255,69,58,0.12); color:#FF453A; }
+.badge-neut { background:rgba(255,214,10,0.12); color:#FFD60A; }
+.badge-squeeze { background:rgba(191,90,242,0.15); color:#BF5AF2; }
+.badge-rvol { background:rgba(52,199,89,0.12); color:#34C759; }
+.badge-runner { background:linear-gradient(135deg, rgba(255,69,58,0.2), rgba(191,90,242,0.2)); color:#FF6961; border:1px solid rgba(255,69,58,0.2); }
+.mono { font-family:'JetBrains Mono' !important; }
 .live-badge { display:inline-flex; align-items:center; gap:6px; font-family:'JetBrains Mono'; font-size:11px; color:rgba(255,255,255,0.4); }
-.live-dot { width:6px; height:6px; border-radius:50%; background:#34C759; animation:pulse 2s infinite; }
+.live-dot { width:6px; height:6px; border-radius:50%; animation:pulse 2s infinite; }
 @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.4;} }
-.grade-badge { display:inline-flex; align-items:center; justify-content:center; width:48px; height:48px; border-radius:12px; font-family:'JetBrains Mono'; font-size:19px; font-weight:700; }
 .section-label { font-family:'DM Sans'; font-size:11px; color:rgba(255,255,255,0.3); text-transform:uppercase; letter-spacing:0.08em; margin-bottom:12px; margin-top:20px; }
 .driver-row { display:flex; align-items:flex-start; gap:10px; padding:9px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
 .driver-tag { font-family:'JetBrains Mono'; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.06em; padding:2px 8px; border-radius:4px; white-space:nowrap; flex-shrink:0; margin-top:2px; }
-.play-type-badge { display:inline-block; padding:3px 10px; border-radius:6px; font-family:'JetBrains Mono'; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; }
-.news-item { padding:12px 16px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px; margin-bottom:8px; border-left:3px solid rgba(255,255,255,0.1); }
-.news-item.bullish { border-left-color:#34C759; }
-.news-item.bearish { border-left-color:#FF453A; }
-.news-headline { font-family:'DM Sans'; font-size:14px; font-weight:600; color:#F5F5F7; line-height:1.4; margin-bottom:6px; }
-.news-meta { font-family:'JetBrains Mono'; font-size:10px; color:rgba(255,255,255,0.35); }
-.news-summary { font-family:'DM Sans'; font-size:12px; color:rgba(255,255,255,0.5); margin-top:6px; line-height:1.5; }
-.imp-badge { display:inline-block; padding:1px 6px; border-radius:4px; font-family:'JetBrains Mono'; font-size:9px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; margin-right:6px; }
-.vwap-line { background:rgba(10,132,255,0.08); border-radius:8px; padding:10px 14px; font-family:'JetBrains Mono'; font-size:13px; margin-bottom:12px; border:1px solid rgba(10,132,255,0.2); }
+.grade-badge { display:inline-flex; align-items:center; justify-content:center; width:44px; height:44px; border-radius:12px; font-family:'JetBrains Mono'; font-size:18px; font-weight:700; }
+.news-card { padding:10px 14px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px; margin-bottom:6px; }
+.news-card.bullish { border-left:3px solid #34C759; }
+.news-card.bearish { border-left:3px solid #FF453A; }
 .kv-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; }
 .kv-cell { background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px; padding:12px 14px; }
 .kv-label { font-family:'DM Sans'; font-size:10px; color:rgba(255,255,255,0.3); text-transform:uppercase; letter-spacing:0.06em; margin-bottom:4px; }
 .kv-value { font-family:'JetBrains Mono'; font-size:16px; font-weight:600; color:#F5F5F7; }
 .kv-sub { font-family:'DM Sans'; font-size:10px; color:rgba(255,255,255,0.2); margin-top:2px; }
+.runner-score-bar { height:8px; border-radius:4px; background:rgba(255,255,255,0.06); overflow:hidden; margin-top:6px; }
+.runner-score-fill { height:100%; border-radius:4px; background:linear-gradient(90deg, #FF453A, #BF5AF2, #34C759); }
 .play-card { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:18px; padding:24px; margin-bottom:18px; position:relative; overflow:hidden; }
 .play-card::before { content:''; position:absolute; top:0; left:0; right:0; height:3px; border-radius:18px 18px 0 0; }
 .play-card.bullish::before { background:linear-gradient(90deg,#34C759,#30D158); }
 .play-card.bearish::before { background:linear-gradient(90deg,#FF453A,#FF6961); }
 .play-card.neutral::before { background:linear-gradient(90deg,#0A84FF,#5AC8FA); }
 .play-card.volatility::before { background:linear-gradient(90deg,#BF5AF2,#FF6FF1); }
-.play-strategy { font-family:'DM Sans'; font-size:22px; font-weight:700; color:#F5F5F7; letter-spacing:-0.02em; }
-.leg-row { display:flex; align-items:center; gap:12px; padding:10px 14px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px; margin-bottom:6px; font-family:'JetBrains Mono'; font-size:13px; }
-.leg-direction { font-weight:700; font-size:11px; text-transform:uppercase; letter-spacing:0.06em; padding:2px 8px; border-radius:4px; }
-.thesis-block { background:rgba(255,255,255,0.02); border-left:3px solid rgba(255,255,255,0.1); padding:16px 20px; border-radius:0 10px 10px 0; font-family:'DM Sans'; font-size:14px; color:rgba(255,255,255,0.6); line-height:1.7; }
-.ci-bar-container { position:relative; height:40px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid rgba(255,255,255,0.06); overflow:hidden; margin:12px 0; }
+.thesis-block { background:rgba(255,255,255,0.02); border-left:3px solid rgba(255,255,255,0.1); padding:14px 18px; border-radius:0 10px 10px 0; font-family:'DM Sans'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.7; }
+.ci-bar-container { position:relative; height:36px; background:rgba(255,255,255,0.03); border-radius:8px; border:1px solid rgba(255,255,255,0.06); overflow:hidden; margin:10px 0; }
 .ci-bar-fill { position:absolute; top:0; bottom:0; border-radius:8px; opacity:0.2; }
 .ci-marker { position:absolute; top:50%; transform:translate(-50%,-50%); font-family:'JetBrains Mono'; font-size:10px; font-weight:600; white-space:nowrap; }
-.risk-item { display:flex; align-items:flex-start; gap:8px; padding:6px 0; font-family:'DM Sans'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5; }
-</style>
-""", unsafe_allow_html=True)
+.risk-item { display:flex; align-items:flex-start; gap:8px; padding:5px 0; font-family:'DM Sans'; font-size:12px; color:rgba(255,255,255,0.5); line-height:1.5; }
+.leg-row { display:flex; align-items:center; gap:10px; padding:8px 12px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:8px; margin-bottom:4px; font-family:'JetBrains Mono'; font-size:12px; }
+.leg-dir { font-weight:700; font-size:10px; text-transform:uppercase; letter-spacing:0.06em; padding:2px 6px; border-radius:4px; }
+</style>""", unsafe_allow_html=True)
 
-PLOTLY_LAYOUT = dict(
-    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    font=dict(family="DM Sans, sans-serif", color="rgba(255,255,255,0.5)", size=11),
-    margin=dict(l=0, r=0, t=30, b=0),
-    xaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
-    yaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
-    hoverlabel=dict(bgcolor="#1c1c1e", font_size=12, font_family="JetBrains Mono"),
-)
-
+# ─── Helpers ─────────────────────────────────────────────────────
 def color_for(d): return {"bullish":"#34C759","bearish":"#FF453A"}.get(d,"#FFD60A")
 def icon_for(d): return {"bullish":"↑","bearish":"↓"}.get(d,"→")
 def grade_color(g):
@@ -191,49 +127,137 @@ def grade_color(g):
     if g.startswith("B"): return "#0A84FF"
     if g.startswith("C"): return "#FFD60A"
     return "#FF453A"
-def sentiment_color(s):
-    return {"bullish":"#34C759","bearish":"#FF453A"}.get(s,"rgba(255,255,255,0.3)")
-
+def sentiment_color(s): return {"bullish":"#34C759","bearish":"#FF453A"}.get(s,"rgba(255,255,255,0.3)")
 def to_list(df, col):
-    """
-    Return a plain Python list of floats for a DataFrame column.
-    Plotly 6.x on Python 3.14 rejects numpy arrays and pandas Series
-    for Candlestick OHLC fields in some configurations. Plain Python
-    lists always pass validation.
-    """
     s = df[col]
-    if isinstance(s, pd.DataFrame):
-        s = s.iloc[:, 0]
+    if isinstance(s, pd.DataFrame): s = s.iloc[:, 0]
     return [float(v) for v in s.values.ravel()]
-
-
 def idx_to_str(index):
+    try: return [t.isoformat() for t in index]
+    except: return list(index)
+
+def compute_runner_score(sig, profile=None, news=None):
     """
-    Convert a DatetimeIndex to a list of ISO strings.
-    Plotly 6.x on Python 3.14 can choke on timezone-aware pandas
-    DatetimeIndex objects passed directly to x= parameters.
+    Model what drives a penny from $0.30 → $20+.
+    The pattern that repeats in every multi-bagger runner:
+    1. Micro/low float (supply scarcity)
+    2. Volume explosion (demand surge)
+    3. Catalyst (news ignition)
+    4. Short squeeze fuel
+    5. Technical compression (coiled spring)
+    6. Momentum ignition (breakout confirmation)
     """
-    try:
-        return [t.isoformat() for t in index]
-    except Exception:
-        return list(index)
+    pts = 0
+    factors = []
+
+    # 1. FLOAT SCARCITY (0-25) — THE #1 DRIVER
+    fm = profile.float_shares_m if profile and profile.float_shares_m > 0 else 0
+    if 0 < fm < 10:
+        pts += 25
+        factors.append(("🔥 Micro Float", f"{fm:.1f}M shares — extreme scarcity. This is the #1 ingredient in every $0.30→$20 runner. Low supply + any demand = explosive moves.", "#FF453A"))
+    elif fm < 30:
+        pts += 18
+        factors.append(("Low Float", f"{fm:.1f}M shares — strong scarcity. Low floats account for 80% of multi-day runners.", "#FFD60A"))
+    elif fm < 100:
+        pts += 8
+        factors.append(("Medium Float", f"{fm:.1f}M — moderate. Needs heavier volume to move significantly.", "rgba(255,255,255,0.5)"))
+    elif fm > 0:
+        factors.append(("Large Float", f"{fm:.0f}M — too much supply for explosive runner dynamics.", "rgba(255,255,255,0.3)"))
+
+    # 2. VOLUME EXPLOSION (0-25) — THE IGNITION
+    rv5 = sig.rvol_5
+    rv20 = sig.rvol_20
+    if rv5 >= 3.0:
+        pts += 25
+        factors.append(("🔥 Volume Explosion", f"RVol {rv5:.1f}x — this is the ignition. Every $0.30→$20 move starts with a 3x+ volume day. Smart money is entering.", "#FF453A"))
+    elif rv5 >= 2.0:
+        pts += 18
+        factors.append(("Volume Surge", f"RVol {rv5:.1f}x — significant institutional interest. Volume precedes price in every runner.", "#34C759"))
+    elif rv5 >= 1.5:
+        pts += 10
+        factors.append(("Volume Rising", f"RVol {rv5:.1f}x — early accumulation phase. Watch for acceleration.", "#FFD60A"))
+    elif rv20 >= 1.3:
+        pts += 5
+        factors.append(("Volume Warming", f"20d RVol {rv20:.1f}x — slow build. Not yet runner territory.", "rgba(255,255,255,0.5)"))
+    else:
+        factors.append(("Dead Volume", f"RVol {rv5:.1f}x — no interest. Runners don't start without volume.", "rgba(255,255,255,0.3)"))
+
+    # 3. CATALYST / NEWS (0-20)
+    if news:
+        from datetime import timedelta
+        recent_bull = [n for n in news if n.sentiment == "bullish" and (datetime.utcnow() - n.datetime_utc).total_seconds() < 72*3600]
+        high_imp = [n for n in recent_bull if n.importance >= 2]
+        if len(high_imp) >= 2:
+            pts += 20
+            factors.append(("🔥 Major Catalyst", f"{len(high_imp)} high-impact bullish catalysts — this is the spark. FDA, contract, acquisition news drives 10x+ moves.", "#FF453A"))
+        elif len(high_imp) == 1:
+            pts += 14
+            factors.append(("Catalyst Active", f"Key bullish news: {high_imp[0].headline[:70]}...", "#34C759"))
+        elif len(recent_bull) >= 2:
+            pts += 8
+            factors.append(("Positive Flow", f"{len(recent_bull)} bullish headlines — building narrative momentum.", "#FFD60A"))
+        elif recent_bull:
+            pts += 4
+            factors.append(("Mild Positive", "Some bullish coverage, but no high-impact catalyst yet.", "rgba(255,255,255,0.5)"))
+        else:
+            factors.append(("No Catalyst", "No bullish news — runners need a story to attract retail buying.", "rgba(255,255,255,0.3)"))
+    else:
+        factors.append(("News N/A", "Set FINNHUB_API_KEY for catalyst detection.", "rgba(255,255,255,0.25)"))
+
+    # 4. SHORT SQUEEZE FUEL (0-15)
+    sp = profile.short_pct_float if profile else 0
+    if sp >= 25:
+        pts += 15
+        factors.append(("🔥 Squeeze Primed", f"{sp:.1f}% short — this is rocket fuel. When price moves up, shorts are forced to cover, creating a self-reinforcing loop.", "#FF453A"))
+    elif sp >= 15:
+        pts += 10
+        factors.append(("High Short", f"{sp:.1f}% short — squeeze candidate if catalyst hits.", "#FFD60A"))
+    elif sp >= 8:
+        pts += 4
+        factors.append(("Moderate Short", f"{sp:.1f}% short — some squeeze potential.", "rgba(255,255,255,0.5)"))
+    elif sp > 0:
+        factors.append(("Low Short", f"{sp:.1f}% — minimal squeeze dynamics.", "rgba(255,255,255,0.3)"))
+
+    # 5. COMPRESSION (0-10) — COILED SPRING
+    if sig.squeeze_on:
+        pts += 10
+        factors.append(("🔥 Squeeze Loaded", "BB inside Keltner — the spring is coiled. Every multi-bagger runner starts from a tight compression zone.", "#BF5AF2"))
+    elif sig.range_compression < 8:
+        pts += 6
+        factors.append(("Tight Range", f"10-day range only {sig.range_compression:.1f}% — building energy for expansion.", "#FFD60A"))
+    else:
+        factors.append(("Wide Range", f"Range {sig.range_compression:.1f}% — not compressed. May need consolidation first.", "rgba(255,255,255,0.3)"))
+
+    # 6. MOMENTUM IGNITION (0-10)
+    if sig.direction == "bullish" and sig.momentum > 3 and sig.rsi < 70:
+        pts += 10
+        factors.append(("Momentum Igniting", f"ROC +{sig.momentum:.1f}%, RSI {sig.rsi:.0f} — breakout in progress with room to run. This is the confirmation phase.", "#34C759"))
+    elif sig.direction == "bullish" and sig.momentum > 0:
+        pts += 5
+        factors.append(("Momentum Building", f"ROC +{sig.momentum:.1f}% — early stages of a potential move.", "#FFD60A"))
+    elif sig.rsi < 30:
+        pts += 3
+        factors.append(("Oversold Bounce", f"RSI {sig.rsi:.0f} — potential snap-back rally. Some runners start from deep oversold conditions.", "#FFD60A"))
+    else:
+        factors.append(("No Momentum", f"ROC {sig.momentum:+.1f}%, RSI {sig.rsi:.0f} — no directional ignition.", "rgba(255,255,255,0.3)"))
+
+    pts = min(100, pts)
+    grade = "A+" if pts >= 85 else "A" if pts >= 70 else "B+" if pts >= 60 else "B" if pts >= 50 else "C" if pts >= 35 else "D" if pts >= 20 else "F"
+    return pts, grade, factors
 
 # ─── Header ──────────────────────────────────────────────────────
 h1, h2 = st.columns([3, 1])
 with h1:
     st.markdown('<p class="sig-h">Signal</p>', unsafe_allow_html=True)
-    st.markdown('<p class="sig-sub">Professional Trading Analytics · Pro Edition</p>', unsafe_allow_html=True)
+    st.markdown('<p class="sig-sub">Professional Trading Analytics</p>', unsafe_allow_html=True)
 with h2:
-    mkt = "OPEN" if is_market_hours() else "CLOSED"
-    mkt_clr = "#34C759" if mkt == "OPEN" else "rgba(255,255,255,0.3)"
-    st.markdown(
-        f'<div style="text-align:right; padding-top:16px;">'
-        f'<span class="live-badge"><span class="live-dot" style="background:{mkt_clr};"></span> MKT {mkt} · {refresh_choice}</span>'
-        f'<br><span class="mono" style="font-size:11px; color:rgba(255,255,255,0.2);">{datetime.now().strftime("%H:%M:%S")}</span></div>',
-        unsafe_allow_html=True)
+    mkt = is_market_hours()
+    mkt_c = "#34C759" if mkt else "#FF9F0A"
+    mkt_t = "MKT OPEN" if mkt else "AFTER HOURS"
+    st.markdown(f'<div style="text-align:right; padding-top:16px;"><span class="live-badge"><span class="live-dot" style="background:{mkt_c};"></span> {mkt_t} · {refresh_choice}</span><br><span class="mono" style="font-size:11px; color:rgba(255,255,255,0.2);">{datetime.now().strftime("%H:%M:%S")}</span></div>', unsafe_allow_html=True)
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
-# ─── Data Pipeline ───────────────────────────────────────────────
+# ─── Data Pipeline (ALWAYS runs — no market gating) ──────────────
 @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice, 120), show_spinner=False)
 def load_and_predict(tickers, lookback):
     data = fetch_batch_data(tickers, period=lookback)
@@ -244,84 +268,59 @@ def load_and_predict(tickers, lookback):
 def load_intraday(tickers):
     return fetch_intraday_batch(tickers, days=5)
 
-progress = st.progress(0, text="Fetching daily market data & running models...")
+progress = st.progress(0, text="Loading market data...")
 data_dict, signals = load_and_predict(tuple(selected_tickers), lookback)
-progress.progress(40, text="Daily models complete.")
+progress.progress(40, text="Models complete.")
 
-# Intraday (optional — skip if market closed to save API)
-intraday_dict = {}
-intraday_stats_dict = {}
+intraday_dict, intraday_stats_dict = {}, {}
 if enable_intraday:
-    progress.progress(55, text="Fetching 5-minute intraday bars...")
+    progress.progress(55, text="Fetching intraday bars...")
     intraday_dict = load_intraday(tuple(selected_tickers))
     for t, df in intraday_dict.items():
-        sig = signals.get(t)
-        avg_vol = 0
-        if sig and t in data_dict:
-            daily = data_dict[t]
-            avg_vol = float(daily["Volume"].tail(20).mean())
+        avg_vol = float(data_dict[t]["Volume"].tail(20).mean()) if t in data_dict else 0
         stats = compute_intraday_stats(t, df, avg_daily_vol=avg_vol)
-        if stats:
-            intraday_stats_dict[t] = stats
-    progress.progress(75, text="Intraday data complete.")
+        if stats: intraday_stats_dict[t] = stats
+    progress.progress(70)
 
-# Pro scoring: merge signals with profile/news/intraday
-pro_scores = {}
-profiles = {}
-news_by_ticker = {}
-
+pro_scores, profiles, news_by_ticker = {}, {}, {}
 if enable_pro:
-    progress.progress(80, text="Computing pro-grade breakout scores...")
+    progress.progress(80, text="Pro scoring...")
     for ticker, sig in signals.items():
-        profile = fetch_company_profile(ticker) if FINNHUB_KEY_PRESENT or True else None
-        news = fetch_news(ticker, days_back=3, max_items=5) if FINNHUB_KEY_PRESENT else []
+        profile = fetch_company_profile(ticker)
+        news = fetch_news(ticker, days_back=5, max_items=8) if FINNHUB_KEY_PRESENT else []
         profiles[ticker] = profile
         news_by_ticker[ticker] = news
-
-        daily_vol = 0
-        if ticker in data_dict:
-            daily_vol = float(data_dict[ticker]["Volume"].iloc[-1])
-
-        pro = compute_pro_breakout(
-            base_score=sig.breakout_score,
-            ticker=ticker,
-            daily_volume=daily_vol,
-            profile=profile,
-            news_items=news,
-            intraday_stats=intraday_stats_dict.get(ticker),
-        )
+        daily_vol = float(data_dict[ticker]["Volume"].iloc[-1]) if ticker in data_dict else 0
+        pro = compute_pro_breakout(sig.breakout_score, ticker, daily_vol, profile, news, intraday_stats_dict.get(ticker))
         pro_scores[ticker] = pro
 
 progress.progress(100, text="Ready.")
 progress.empty()
 
-# ─── Summary Metrics ─────────────────────────────────────────────
+# ─── Metrics ─────────────────────────────────────────────────────
 bull = sum(1 for s in signals.values() if s.direction == "bullish")
 bear = sum(1 for s in signals.values() if s.direction == "bearish")
 neut = len(signals) - bull - bear
-if pro_scores:
-    top_pro = sum(1 for p in pro_scores.values() if p.total_score >= 100)
-    avg_pro = np.mean([p.total_score for p in pro_scores.values()])
-else:
-    top_pro = sum(1 for s in signals.values() if s.breakout_score >= 65)
-    avg_pro = np.mean([s.breakout_score for s in signals.values()]) if signals else 0
+avg_score = np.mean([pro_scores[t].total_score for t in pro_scores]) if pro_scores else (np.mean([s.breakout_score for s in signals.values()]) if signals else 0)
+penny_runners = sum(1 for t in signals if is_penny_stock(t) and compute_runner_score(signals[t], profiles.get(t), news_by_ticker.get(t, []))[0] >= 50)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1,c2,c3,c4,c5 = st.columns(5)
 c1.metric("Bullish", bull)
 c2.metric("Bearish", bear)
 c3.metric("Neutral", neut)
-c4.metric("Avg Score", f"{avg_pro:.0f}")
-c5.metric("High Probability", f"{top_pro}", delta="Score ≥ 100" if pro_scores else "Score ≥ 65")
+c4.metric("Avg Score", f"{avg_score:.0f}")
+c5.metric("Runner Alerts", penny_runners, delta="Score ≥ 50")
+st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
-st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-# ─── Tabs ─────────────────────────────────────────────────────────
-tab_overview, tab_breakout, tab_penny, tab_intraday, tab_detail, tab_options, tab_heatmap = st.tabs([
-    "◉ Overview", "🔥 Breakout Scanner", "🎰 Penny Intel",
-    "⚡ Intraday (5m)", "◎ Detail", "⬡ Options", "◈ Heatmap",
+# ═══════════════════════════════════════════════════════════════════
+# TABS
+# ═══════════════════════════════════════════════════════════════════
+tab_overview, tab_penny, tab_breakout, tab_detail, tab_options, tab_heatmap = st.tabs([
+    "◉ Overview", "🚀 Penny Runners", "🔥 Breakout Scanner",
+    "◎ Detail + News", "⬡ Options", "◈ Heatmap",
 ])
 
-# ═══ TAB 1: OVERVIEW ═══
+# ═══ TAB 1: OVERVIEW (card grid) ═══
 with tab_overview:
     if not signals:
         st.warning("No signals available.")
@@ -335,814 +334,391 @@ with tab_overview:
             pro = pro_scores.get(sig.ticker)
             grade = pro.total_grade if pro else sig.breakout_grade
             score = pro.total_score if pro else sig.breakout_score
-            max_s = 150 if pro else 100
             gc = grade_color(grade)
+            badge_cls = "badge-bull" if sig.direction == "bullish" else "badge-bear" if sig.direction == "bearish" else "badge-neut"
+            chg_c = "#34C759" if sig.change_1d >= 0 else "#FF453A"
+            intra = intraday_stats_dict.get(sig.ticker)
+            vwap_html = ""
+            if intra:
+                vw = "▲" if intra.above_vwap else "▼"
+                vw_c = "#34C759" if intra.above_vwap else "#FF453A"
+                vwap_html = f'<span style="color:{vw_c}; font-weight:600;">{vw}</span> '
 
             with cols[idx % 3]:
                 with st.container(border=True):
                     st.markdown(
-                        f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                        f'<div style="display:flex; justify-content:space-between; align-items:flex-start;">'
                         f'<div><span style="font-family:\'DM Sans\'; font-size:20px; font-weight:700; color:#F5F5F7;">{sig.ticker}</span>'
-                        f'<span style="font-size:10px; color:rgba(255,255,255,0.25); margin-left:8px;">{tier}</span></div>'
-                        f'<span class="badge-{sig.direction}">{icon_for(sig.direction)} {sig.direction.title()}</span></div>',
+                        f'<span style="font-size:10px; color:rgba(255,255,255,0.2); margin-left:6px;">{tier}</span></div>'
+                        f'<span class="badge {badge_cls}">{icon_for(sig.direction)} {sig.direction.title()}</span></div>'
+                        f'<div style="margin:8px 0;">'
+                        f'<span class="mono" style="font-size:22px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</span>'
+                        f'<span class="mono" style="font-size:12px; color:{chg_c}; margin-left:8px;">{"+" if sig.change_1d>=0 else ""}{sig.change_1d:.2f}%</span></div>'
+                        f'<div style="display:flex; gap:10px; font-family:\'JetBrains Mono\'; font-size:11px;">'
+                        f'{vwap_html}'
+                        f'<span style="color:rgba(255,255,255,0.3);">Conf</span><span style="color:{clr}; font-weight:600;">{sig.confidence}%</span> '
+                        f'<span style="color:rgba(255,255,255,0.3);">RVol</span><span style="color:#F5F5F7;">{sig.volume_ratio}x</span> '
+                        f'<span style="color:{gc}; font-weight:700;">{grade}</span></div>',
                         unsafe_allow_html=True)
-                    chg_c = "#34C759" if sig.change_1d >= 0 else "#FF453A"
-                    st.markdown(
-                        f'<div style="margin:10px 0;">'
-                        f'<span class="mono" style="font-size:24px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</span>'
-                        f'<span class="mono" style="font-size:13px; color:{chg_c}; margin-left:10px;">{"+" if sig.change_1d>=0 else ""}{sig.change_1d:.2f}%</span></div>',
-                        unsafe_allow_html=True)
-                    st.markdown(
-                        f'<div style="display:flex; gap:12px; font-family:\'JetBrains Mono\'; font-size:12px; align-items:center;">'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Conf</span> <span style="color:{clr}; font-weight:600;">{sig.confidence}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol</span> <span style="color:#F5F5F7;">{sig.volume_ratio}x</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Score</span> <span style="color:{gc}; font-weight:700;">{grade} ({score:.0f}/{max_s})</span></div>'
-                        f'</div>', unsafe_allow_html=True)
                     top = sig.signals[0] if sig.signals else "—"
-                    st.markdown(f'<div style="margin-top:10px; padding-top:10px; border-top:1px solid rgba(255,255,255,0.04);"><div class="sig-item"><span class="sig-dot" style="background:{clr}; box-shadow:0 0 6px {clr}60;"></span>{top}</div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="margin-top:8px; padding-top:8px; border-top:1px solid rgba(255,255,255,0.04); font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.5);">{top}</div>', unsafe_allow_html=True)
 
-# ═══ TAB 2: BREAKOUT SCANNER ═══
+# ═══ TAB 2: PENNY RUNNERS (card grid with runner pattern analysis) ═══
+with tab_penny:
+    penny_sigs = {t: s for t, s in signals.items() if is_penny_stock(t)}
+    if not penny_sigs:
+        st.warning("No penny stocks in watchlist. Select 'All' or 'Penny/Small' in sidebar.")
+    else:
+        mkt_label = "Live Market" if mkt else "After-Hours Prep"
+        st.markdown(f'<p class="section-label">🚀 {mkt_label} · Penny Runner Scanner</p>', unsafe_allow_html=True)
+        st.markdown(
+            '<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.7;">'
+            'Models what drives small stocks from <span style="color:#FF453A; font-weight:600;">$0.30 → $20+</span>: '
+            '<strong style="color:rgba(255,255,255,0.6);">float scarcity</strong> (supply), '
+            '<strong style="color:rgba(255,255,255,0.6);">volume explosion</strong> (demand), '
+            '<strong style="color:rgba(255,255,255,0.6);">news catalyst</strong> (ignition), '
+            '<strong style="color:rgba(255,255,255,0.6);">short squeeze fuel</strong> (forced buying), '
+            '<strong style="color:rgba(255,255,255,0.6);">compression</strong> (coiled spring), '
+            '<strong style="color:rgba(255,255,255,0.6);">momentum ignition</strong> (confirmation). '
+            'Scanned continuously — even after hours.'
+            '</div>', unsafe_allow_html=True)
+
+        # Compute runner scores
+        runner_data = {}
+        for t, s in penny_sigs.items():
+            pts, grade, factors = compute_runner_score(s, profiles.get(t), news_by_ticker.get(t, []))
+            runner_data[t] = (pts, grade, factors)
+
+        sorted_pennies = sorted(runner_data.keys(), key=lambda t: runner_data[t][0], reverse=True)
+
+        # Summary metrics
+        pc1, pc2, pc3, pc4 = st.columns(4)
+        high_runners = sum(1 for t in runner_data if runner_data[t][0] >= 60)
+        squeezes = sum(1 for t in penny_sigs.values() if t.squeeze_on)
+        high_rvol = sum(1 for t in penny_sigs.values() if t.rvol_5 > 2)
+        best = sorted_pennies[0] if sorted_pennies else "—"
+        pc1.metric("Runner Setups", high_runners, delta="Score ≥ 60")
+        pc2.metric("Squeezes", squeezes)
+        pc3.metric("Vol Explosions", high_rvol, delta="RVol > 2x")
+        pc4.metric("Top Pick", best)
+
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+        # CARD GRID — 2 columns side by side
+        cols = st.columns(2)
+        for idx, t in enumerate(sorted_pennies):
+            sig = penny_sigs[t]
+            pts, grade, factors = runner_data[t]
+            profile = profiles.get(t)
+            news = news_by_ticker.get(t, [])
+            intra = intraday_stats_dict.get(t)
+            name, tier, sector = get_ticker_info(t)
+            clr = color_for(sig.direction)
+            gc = grade_color(grade)
+            chg_c = "#34C759" if sig.change_1d >= 0 else "#FF453A"
+
+            with cols[idx % 2]:
+                with st.container(border=True):
+                    # Header with grade + price
+                    st.markdown(
+                        f'<div style="display:flex; justify-content:space-between; align-items:flex-start;">'
+                        f'<div style="display:flex; align-items:center; gap:10px;">'
+                        f'<span class="grade-badge" style="background:{gc}18; color:{gc}; border:2px solid {gc}35;">{grade}</span>'
+                        f'<div>'
+                        f'<span style="font-family:\'DM Sans\'; font-size:20px; font-weight:700; color:#F5F5F7;">{t}</span>'
+                        f'<span style="font-size:11px; color:rgba(255,255,255,0.3); margin-left:8px;">{name}</span>'
+                        f'<div style="display:flex; gap:4px; margin-top:3px; flex-wrap:wrap;">'
+                        f'<span class="badge {"badge-bull" if sig.direction == "bullish" else "badge-bear" if sig.direction == "bearish" else "badge-neut"}">{icon_for(sig.direction)} {sig.direction.title()}</span>'
+                        + (' <span class="badge badge-squeeze">🔥 Squeeze</span>' if sig.squeeze_on else '')
+                        + (f' <span class="badge badge-rvol">⚡ {sig.rvol_5:.1f}x Vol</span>' if sig.rvol_5 > 1.5 else '')
+                        + (' <span class="badge badge-runner">🚀 Runner Setup</span>' if pts >= 60 else '')
+                        + f'</div></div></div>'
+                        f'<div style="text-align:right;">'
+                        f'<div class="mono" style="font-size:22px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</div>'
+                        f'<div class="mono" style="font-size:12px; color:{chg_c};">{sig.change_1d:+.2f}%</div>'
+                        f'</div></div>', unsafe_allow_html=True)
+
+                    # Runner Score Bar
+                    st.markdown(
+                        f'<div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px;">'
+                        f'<span style="font-family:\'DM Sans\'; font-size:10px; color:rgba(255,255,255,0.3); text-transform:uppercase; letter-spacing:0.06em;">Runner Score</span>'
+                        f'<span class="mono" style="font-size:14px; font-weight:700; color:{gc};">{pts}/100</span></div>'
+                        f'<div class="runner-score-bar"><div class="runner-score-fill" style="width:{pts}%;"></div></div>',
+                        unsafe_allow_html=True)
+
+                    # Key metrics row
+                    float_txt = f"{profile.float_shares_m:.0f}M" if profile and profile.float_shares_m > 0 else "—"
+                    short_txt = f"{profile.short_pct_float:.1f}%" if profile and profile.short_pct_float > 0 else "—"
+                    st.markdown(
+                        f'<div style="display:flex; gap:12px; margin:10px 0; font-family:\'JetBrains Mono\'; font-size:11px; flex-wrap:wrap;">'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Float</span> <span style="color:#F5F5F7;">{float_txt}</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Short</span> <span style="color:#F5F5F7;">{short_txt}</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">RSI</span> <span style="color:#F5F5F7;">{sig.rsi:.0f}</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">5D</span> <span style="color:{"#34C759" if sig.change_5d>=0 else "#FF453A"};">{sig.change_5d:+.1f}%</span></div>'
+                        f'<div><span style="color:rgba(255,255,255,0.3);">Conf</span> <span style="color:{clr};">{sig.confidence}%</span></div>'
+                        f'</div>', unsafe_allow_html=True)
+
+                    # Runner factors (the core value prop)
+                    for fname, fdesc, fcolor in factors[:4]:
+                        st.markdown(
+                            f'<div style="display:flex; align-items:flex-start; gap:8px; padding:5px 0; border-bottom:1px solid rgba(255,255,255,0.03);">'
+                            f'<span style="font-family:\'JetBrains Mono\'; font-size:10px; font-weight:600; color:{fcolor}; white-space:nowrap; margin-top:2px;">{fname}</span>'
+                            f'<span style="font-family:\'DM Sans\'; font-size:11px; color:rgba(255,255,255,0.5); line-height:1.5;">{fdesc}</span>'
+                            f'</div>', unsafe_allow_html=True)
+
+                    # Inline news (top 2 headlines)
+                    if news:
+                        bull_news = [n for n in news if n.sentiment == "bullish"][:2]
+                        for n in bull_news:
+                            hrs = (datetime.utcnow() - n.datetime_utc).total_seconds() / 3600
+                            fresh = "🔴" if hrs < 12 else "🟡" if hrs < 48 else ""
+                            st.markdown(
+                                f'<div class="news-card bullish" style="margin-top:6px;">'
+                                f'<div style="font-family:\'DM Sans\'; font-size:12px; font-weight:600; color:#F5F5F7;">{fresh} {n.headline[:80]}{"..." if len(n.headline)>80 else ""}</div>'
+                                f'<div style="font-family:\'JetBrains Mono\'; font-size:9px; color:rgba(255,255,255,0.3);">{n.source} · {hrs:.0f}h ago</div>'
+                                f'</div>', unsafe_allow_html=True)
+
+        # Summary table
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.markdown('<p class="section-label">Penny Runner Ranking</p>', unsafe_allow_html=True)
+        tbl = []
+        for t in sorted_pennies:
+            s = penny_sigs[t]
+            pts, grade, _ = runner_data[t]
+            pf = profiles.get(t)
+            nw = news_by_ticker.get(t, [])
+            tbl.append({"Ticker":t, "Price":f"${s.price:,.2f}", "1D":f"{s.change_1d:+.2f}%", "5D":f"{s.change_5d:+.2f}%",
+                "RVol":f"{s.rvol_5:.1f}x", "Squeeze":"🔥" if s.squeeze_on else "—",
+                "Float":f"{pf.float_shares_m:.0f}M" if pf and pf.float_shares_m>0 else "—",
+                "Short%":f"{pf.short_pct_float:.1f}%" if pf and pf.short_pct_float>0 else "—",
+                "News":f"{sum(1 for n in nw if n.sentiment=='bullish')}↑" if nw else "—",
+                "Runner":f"{pts}", "Grade":grade})
+        st.dataframe(pd.DataFrame(tbl), use_container_width=True, hide_index=True, height=min(400, 40+len(tbl)*38))
+
+# ═══ TAB 3: BREAKOUT SCANNER ═══
 with tab_breakout:
     if not signals:
         st.info("No data.")
     else:
-        if pro_scores:
-            st.markdown('<p class="section-label">Pro Breakout Scanner — Base (100) + Pro Factors (50) = Total (150)</p>', unsafe_allow_html=True)
-            st.markdown(
-                '<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">'
-                'Rates every ticker on technical patterns <em>and</em> professional trader signals: float size, '
-                'float turnover rate, short squeeze potential, recent news catalysts, and intraday structure.'
-                '</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<p class="section-label">Breakout Scanner (Enable Pro Scoring for full analysis)</p>', unsafe_allow_html=True)
-
+        st.markdown('<p class="section-label">Breakout Scanner — All Tickers</p>', unsafe_allow_html=True)
         fc1, fc2 = st.columns([1, 1])
         with fc1:
-            max_score = 150 if pro_scores else 100
-            default_min = 60 if pro_scores else 30
-            min_score = st.slider("Min Score", 0, max_score, default_min, 5)
+            max_sc = 150 if pro_scores else 100
+            min_score = st.slider("Min Score", 0, max_sc, 30, 5)
         with fc2:
-            tier_filter = st.radio("Tier", ["All", "Penny/Small", "Large Cap"], horizontal=True)
+            tf = st.radio("Tier", ["All", "Penny", "Large Cap"], horizontal=True)
 
         def get_score(t):
-            return pro_scores[t].total_score if pro_scores else signals[t].breakout_score
-
-        sorted_tickers = sorted(signals.keys(), key=get_score, reverse=True)
-        filtered = [t for t in sorted_tickers if get_score(t) >= min_score]
-        if tier_filter == "Penny/Small":
-            filtered = [t for t in filtered if is_penny_stock(t)]
-        elif tier_filter == "Large Cap":
-            filtered = [t for t in filtered if not is_penny_stock(t)]
+            return pro_scores[t].total_score if t in pro_scores else signals[t].breakout_score
+        sorted_t = sorted(signals.keys(), key=get_score, reverse=True)
+        filtered = [t for t in sorted_t if get_score(t) >= min_score]
+        if tf == "Penny": filtered = [t for t in filtered if is_penny_stock(t)]
+        elif tf == "Large Cap": filtered = [t for t in filtered if not is_penny_stock(t)]
 
         if not filtered:
-            st.info("No tickers match filters.")
+            st.info("No tickers match.")
         else:
-            for t in filtered:
+            cols = st.columns(2)
+            for idx, t in enumerate(filtered):
                 sig = signals[t]
                 pro = pro_scores.get(t)
-                profile = profiles.get(t)
-                news = news_by_ticker.get(t, [])
-                name, tier, sector = get_ticker_info(t)
-                clr = color_for(sig.direction)
-
-                grade = pro.total_grade if pro else sig.breakout_grade
-                score = pro.total_score if pro else sig.breakout_score
-                max_s = 150 if pro else 100
-                gc = grade_color(grade)
-
-                with st.container(border=True):
-                    # Header
-                    hc1, hc2 = st.columns([4, 1])
-                    with hc1:
-                        profile_text = ""
-                        if profile:
-                            if profile.float_shares_m > 0:
-                                profile_text = f" · Float: {profile.float_shares_m:.1f}M"
-                            if profile.short_pct_float > 0:
-                                profile_text += f" · Short: {profile.short_pct_float:.1f}%"
-                        st.markdown(
-                            f'<div style="display:flex; align-items:center; gap:14px;">'
-                            f'<span class="grade-badge" style="background:{gc}20; color:{gc}; border:2px solid {gc}40;">{grade}</span>'
-                            f'<div>'
-                            f'<span style="font-family:\'DM Sans\'; font-size:22px; font-weight:700; color:#F5F5F7;">{t}</span>'
-                            f'<span style="font-size:13px; color:rgba(255,255,255,0.35); margin-left:10px;">{name} · {sector}{profile_text}</span>'
-                            f'<div style="display:flex; gap:8px; margin-top:4px;">'
-                            f'<span class="play-type-badge" style="background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.5);">{tier}</span>'
-                            f'<span class="badge-{sig.direction}">{icon_for(sig.direction)} {sig.direction.title()}</span>'
-                            f'</div></div></div>', unsafe_allow_html=True)
-                    with hc2:
-                        if pro:
-                            st.markdown(
-                                f'<div style="text-align:right;">'
-                                f'<div class="kv-label">Total Score</div>'
-                                f'<div class="mono" style="font-size:28px; font-weight:700; color:{gc};">{score:.0f}<span style="font-size:14px; color:rgba(255,255,255,0.3);">/{max_s}</span></div>'
-                                f'<div style="font-family:\'JetBrains Mono\'; font-size:10px; color:rgba(255,255,255,0.4);">Base {pro.base_score:.0f} + Pro {pro.pro_score:.0f}</div>'
-                                f'<div style="height:4px; border-radius:2px; background:rgba(255,255,255,0.06); overflow:hidden; margin-top:6px;">'
-                                f'<div style="height:100%; width:{(score/max_s)*100:.0f}%; background:{gc}; border-radius:2px;"></div>'
-                                f'</div></div>', unsafe_allow_html=True)
-                        else:
-                            st.markdown(
-                                f'<div style="text-align:right;">'
-                                f'<div class="kv-label">Score</div>'
-                                f'<div class="mono" style="font-size:32px; font-weight:700; color:{gc};">{score:.0f}</div>'
-                                f'</div>', unsafe_allow_html=True)
-
-                    # Key metrics
-                    pro_metrics = ""
-                    if pro:
-                        pro_metrics = (
-                            f'<div><span style="color:rgba(255,255,255,0.3);">Turnover</span> <span style="color:#F5F5F7;">{pro.turnover_pct:.1f}%</span></div>'
-                            f'<div><span style="color:rgba(255,255,255,0.3);">News</span> <span style="color:#F5F5F7;">{"+" if pro.catalyst_points > 0 else ""}{pro.catalyst_points:.0f}</span></div>'
-                        )
-                    intraday_stat = intraday_stats_dict.get(t)
-                    intraday_txt = ""
-                    if intraday_stat:
-                        vw_clr = "#34C759" if intraday_stat.above_vwap else "#FF453A"
-                        intraday_txt = f'<div><span style="color:rgba(255,255,255,0.3);">VWAP</span> <span style="color:{vw_clr};">{"↑" if intraday_stat.above_vwap else "↓"}</span></div>'
-
-                    st.markdown(
-                        f'<div style="display:flex; gap:18px; margin:12px 0; font-family:\'JetBrains Mono\'; font-size:12px; flex-wrap:wrap;">'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Price</span> <span style="color:#F5F5F7; font-weight:600;">${sig.price:,.2f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">1D</span> <span style="color:{"#34C759" if sig.change_1d>=0 else "#FF453A"};">{sig.change_1d:+.2f}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol(5d)</span> <span style="color:{"#34C759" if sig.rvol_5>1.5 else "#F5F5F7"}; font-weight:{"700" if sig.rvol_5>2 else "400"};">{sig.rvol_5:.1f}x</span></div>'
-                        f'{pro_metrics}'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Squeeze</span> <span style="color:{"#BF5AF2" if sig.squeeze_on else "rgba(255,255,255,0.3)"};">{"🔥" if sig.squeeze_on else "—"}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">From High</span> <span style="color:#F5F5F7;">{sig.pct_from_high:+.1f}%</span></div>'
-                        f'{intraday_txt}'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RSI</span> <span style="color:#F5F5F7;">{sig.rsi:.0f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Conf</span> <span style="color:{clr};">{sig.confidence}%</span></div>'
-                        f'</div>', unsafe_allow_html=True)
-
-                    # Factors (base + pro)
-                    impact_colors = {
-                        "critical":("#FF453A","rgba(255,69,58,0.15)"),
-                        "strong":("#34C759","rgba(52,199,89,0.12)"),
-                        "moderate":("#FFD60A","rgba(255,214,10,0.12)"),
-                        "weak":("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"),
-                        "negative":("#FF6961","rgba(255,105,97,0.10)"),
-                        "neutral":("rgba(255,255,255,0.3)","rgba(255,255,255,0.04)"),
-                        "signal":("#BF5AF2","rgba(191,90,242,0.12)"),
-                    }
-                    all_factors = list(sig.breakout_factors)
-                    if pro:
-                        all_factors.extend(pro.pro_factors)
-                    for factor, desc, impact in all_factors:
-                        ic, ib = impact_colors.get(impact, ("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"))
-                        st.markdown(f'<div class="driver-row"><span class="driver-tag" style="background:{ib}; color:{ic};">{factor}</span><span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5;">{desc}</span></div>', unsafe_allow_html=True)
-
-                    # Recent news inline
-                    if news:
-                        st.markdown('<p class="section-label" style="margin-top:16px;">Recent Catalysts</p>', unsafe_allow_html=True)
-                        for n in news[:3]:
-                            sent_c = sentiment_color(n.sentiment)
-                            imp_txt = "●" * max(1, n.importance)
-                            st.markdown(
-                                f'<div class="news-item {n.sentiment}">'
-                                f'<div class="news-headline">'
-                                f'<span class="imp-badge" style="background:{sent_c}20; color:{sent_c};">{imp_txt} {n.sentiment}</span>'
-                                f'{n.headline}</div>'
-                                f'<div class="news-meta">{n.source} · {n.datetime_utc.strftime("%Y-%m-%d %H:%M UTC")}</div>'
-                                f'</div>', unsafe_allow_html=True)
-
-# ═══ TAB 3: PENNY INTEL ═══
-with tab_penny:
-    if not signals:
-        st.info("No data available.")
-    else:
-        penny_sigs = {t: s for t, s in signals.items() if is_penny_stock(t)}
-        if not penny_sigs:
-            st.warning("No penny stocks in current watchlist. Select 'All' or 'Penny/Small Cap Only' in the sidebar.")
-        else:
-            mkt_open = is_market_hours()
-            if mkt_open:
-                header_text = "Live Market · Penny Stock Intelligence"
-                sub_text = "Real-time penny stock analysis with news catalysts, float structure, and breakout signals."
-            else:
-                header_text = "After-Hours · Penny Stock Overnight Scanner"
-                sub_text = (
-                    "Market is closed. Scanning for overnight catalysts, pre-market gap setups, and next-session opportunities. "
-                    "Professional traders do their best research after hours — this is when you find tomorrow's runners."
-                )
-
-            st.markdown(f'<p class="section-label">{header_text}</p>', unsafe_allow_html=True)
-            st.markdown(f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">{sub_text}</div>', unsafe_allow_html=True)
-
-            # Sort: by pro score if available, else breakout score
-            def penny_sort_key(t):
-                if t in pro_scores:
-                    return pro_scores[t].total_score
-                return penny_sigs[t].breakout_score
-
-            sorted_pennies = sorted(penny_sigs.keys(), key=penny_sort_key, reverse=True)
-
-            # ── Summary cards row ─────────────────────────────
-            pc1, pc2, pc3, pc4 = st.columns(4)
-            penny_bull = sum(1 for s in penny_sigs.values() if s.direction == "bullish")
-            penny_squeeze = sum(1 for s in penny_sigs.values() if s.squeeze_on)
-            penny_high_rvol = sum(1 for s in penny_sigs.values() if s.rvol_5 > 1.5)
-            top_penny = sorted_pennies[0] if sorted_pennies else "—"
-            pc1.metric("Penny Bullish", f"{penny_bull}/{len(penny_sigs)}")
-            pc2.metric("Squeezes Active", penny_squeeze)
-            pc3.metric("High RVol (>1.5x)", penny_high_rvol)
-            pc4.metric("Top Pick", top_penny)
-
-            st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-
-            # ── Per-ticker deep dive cards ────────────────────
-            for t in sorted_pennies:
-                sig = penny_sigs[t]
-                pro = pro_scores.get(t)
-                profile = profiles.get(t)
-                news = news_by_ticker.get(t, [])
-                intra = intraday_stats_dict.get(t)
-                name, tier, sector = get_ticker_info(t)
+                name, _, sector = get_ticker_info(t)
                 clr = color_for(sig.direction)
                 grade = pro.total_grade if pro else sig.breakout_grade
-                score = pro.total_score if pro else sig.breakout_score
-                max_s = 150 if pro else 100
+                score = get_score(t)
                 gc = grade_color(grade)
-
-                with st.container(border=True):
-                    # ── Header ────────────────────────────────
-                    hc1, hc2 = st.columns([4, 1])
-                    with hc1:
-                        float_text = ""
-                        short_text = ""
-                        if profile:
-                            if profile.float_shares_m > 0:
-                                float_text = f" · Float: {profile.float_shares_m:.1f}M"
-                            if profile.short_pct_float > 0:
-                                short_text = f" · Short: {profile.short_pct_float:.1f}%"
+                with cols[idx % 2]:
+                    with st.container(border=True):
                         st.markdown(
-                            f'<div style="display:flex; align-items:center; gap:14px;">'
-                            f'<span class="grade-badge" style="background:{gc}20; color:{gc}; border:2px solid {gc}40;">{grade}</span>'
-                            f'<div>'
-                            f'<span style="font-family:\'DM Sans\'; font-size:22px; font-weight:700; color:#F5F5F7;">{t}</span>'
-                            f'<span style="font-size:13px; color:rgba(255,255,255,0.35); margin-left:10px;">{name} · {sector}{float_text}{short_text}</span>'
-                            f'<div style="display:flex; gap:6px; margin-top:4px; flex-wrap:wrap;">'
-                            f'<span class="badge-{sig.direction}">{icon_for(sig.direction)} {sig.direction.title()}</span>'
-                            + (f'<span class="play-type-badge" style="background:rgba(191,90,242,0.15); color:#BF5AF2;">🔥 Squeeze</span>' if sig.squeeze_on else '')
-                            + (f'<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">📈 High RVol</span>' if sig.rvol_5 > 1.5 else '')
-                            + (f'<span class="play-type-badge" style="background:rgba(255,159,10,0.15); color:#FF9F0A;">⚠ Overbought</span>' if sig.rsi > 70 else '')
-                            + (f'<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">💰 Oversold</span>' if sig.rsi < 30 else '')
-                            + f'</div></div></div>', unsafe_allow_html=True)
-                    with hc2:
-                        st.markdown(
+                            f'<div style="display:flex; justify-content:space-between;">'
+                            f'<div style="display:flex; align-items:center; gap:10px;">'
+                            f'<span class="grade-badge" style="background:{gc}18; color:{gc}; border:2px solid {gc}35;">{grade}</span>'
+                            f'<div><span style="font-family:\'DM Sans\'; font-size:18px; font-weight:700; color:#F5F5F7;">{t}</span>'
+                            f'<span style="font-size:11px; color:rgba(255,255,255,0.3); margin-left:8px;">{name}</span></div></div>'
                             f'<div style="text-align:right;">'
-                            f'<div class="mono" style="font-size:26px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</div>'
-                            f'<div class="mono" style="font-size:13px; color:{"#34C759" if sig.change_1d >= 0 else "#FF453A"};">{sig.change_1d:+.2f}% (1D)</div>'
-                            f'<div class="mono" style="font-size:11px; color:rgba(255,255,255,0.3);">{sig.change_5d:+.2f}% (5D)</div>'
-                            f'</div>', unsafe_allow_html=True)
+                            f'<div class="mono" style="font-size:20px; font-weight:600; color:#F5F5F7;">${sig.price:,.2f}</div>'
+                            f'<div class="mono" style="font-size:11px; color:{"#34C759" if sig.change_1d>=0 else "#FF453A"};">{sig.change_1d:+.2f}%</div></div></div>'
+                            f'<div style="display:flex; gap:10px; margin-top:8px; font-family:\'JetBrains Mono\'; font-size:11px;">'
+                            f'<span style="color:rgba(255,255,255,0.3);">Score</span><span style="color:{gc}; font-weight:700;">{score:.0f}</span> '
+                            f'<span style="color:rgba(255,255,255,0.3);">RVol</span><span>{sig.rvol_5:.1f}x</span> '
+                            f'<span style="color:rgba(255,255,255,0.3);">RSI</span><span>{sig.rsi:.0f}</span> '
+                            f'<span style="color:rgba(255,255,255,0.3);">Conf</span><span style="color:{clr};">{sig.confidence}%</span></div>',
+                            unsafe_allow_html=True)
+                        top = sig.signals[0] if sig.signals else "—"
+                        st.markdown(f'<div style="margin-top:6px; padding-top:6px; border-top:1px solid rgba(255,255,255,0.04); font-family:\'DM Sans\'; font-size:11px; color:rgba(255,255,255,0.45);">{top}</div>', unsafe_allow_html=True)
 
-                    # ── Key Metrics Grid ──────────────────────
-                    st.markdown(
-                        f'<div style="display:flex; gap:16px; margin:14px 0; font-family:\'JetBrains Mono\'; font-size:12px; flex-wrap:wrap;">'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol(5d)</span> <span style="color:{"#34C759" if sig.rvol_5>1.5 else "#F5F5F7"}; font-weight:{"700" if sig.rvol_5>2 else "400"};">{sig.rvol_5:.1f}x</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RVol(20d)</span> <span style="color:#F5F5F7;">{sig.rvol_20:.1f}x</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">RSI</span> <span style="color:#F5F5F7;">{sig.rsi:.0f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Squeeze</span> <span style="color:{"#BF5AF2" if sig.squeeze_on else "rgba(255,255,255,0.3)"};">{"YES" if sig.squeeze_on else "No"}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Range(10d)</span> <span style="color:#F5F5F7;">{sig.range_compression:.1f}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">From High</span> <span style="color:#F5F5F7;">{sig.pct_from_high:+.1f}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Gap</span> <span style="color:{"#34C759" if sig.gap_pct > 1 else "#FF453A" if sig.gap_pct < -1 else "#F5F5F7"};">{sig.gap_pct:+.1f}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Consec Up</span> <span style="color:#F5F5F7;">{sig.consec_up}d</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Conf</span> <span style="color:{clr};">{sig.confidence}%</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Acc</span> <span style="color:#F5F5F7;">{sig.accuracy}%</span></div>'
-                        f'</div>', unsafe_allow_html=True)
-
-                    # ── Float & Short Profile ─────────────────
-                    if profile and (profile.float_shares_m > 0 or profile.short_pct_float > 0 or profile.market_cap_m > 0):
-                        pro_p = pro_scores.get(t)
-                        float_tier = pro_p.float_tier if pro_p else "Unknown"
-                        turnover = pro_p.turnover_pct if pro_p else 0
-
-                        st.markdown('<p class="section-label">Float & Short Profile</p>', unsafe_allow_html=True)
-                        ft_color = "#FF453A" if float_tier in ("Micro Float",) else "#FFD60A" if float_tier == "Low Float" else "#F5F5F7"
-                        st.markdown(
-                            f'<div class="kv-grid">'
-                            f'<div class="kv-cell"><div class="kv-label">Float</div><div class="kv-value" style="color:{ft_color};">{profile.float_shares_m:.1f}M</div><div class="kv-sub">{float_tier}</div></div>'
-                            f'<div class="kv-cell"><div class="kv-label">Market Cap</div><div class="kv-value">${profile.market_cap_m:,.0f}M</div></div>'
-                            f'<div class="kv-cell"><div class="kv-label">Short % Float</div><div class="kv-value" style="color:{"#FF453A" if profile.short_pct_float > 15 else "#F5F5F7"};">{profile.short_pct_float:.1f}%</div><div class="kv-sub">{"⚠ Squeeze risk" if profile.short_pct_float > 20 else "Short ratio: " + str(profile.short_ratio)}</div></div>'
-                            f'</div>', unsafe_allow_html=True)
-
-                        if turnover > 0:
-                            tv_color = "#FF453A" if turnover > 50 else "#34C759" if turnover > 10 else "#F5F5F7"
-                            st.markdown(
-                                f'<div style="margin-top:8px; padding:10px 14px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:10px;">'
-                                f'<span style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.4);">Float Turnover Today: </span>'
-                                f'<span class="mono" style="font-size:14px; font-weight:700; color:{tv_color};">{turnover:.1f}%</span>'
-                                f'<span style="font-family:\'DM Sans\'; font-size:11px; color:rgba(255,255,255,0.25); margin-left:8px;">'
-                                f'{"— Entire float rotated!" if turnover >= 100 else "— Heavy institutional rotation" if turnover >= 50 else "— Strong participation" if turnover >= 25 else "— Normal activity"}'
-                                f'</span></div>', unsafe_allow_html=True)
-
-                    # ── Intraday Snapshot (works after hours too — shows last session) ──
-                    if intra:
-                        vw_c = "#34C759" if intra.above_vwap else "#FF453A"
-                        session_label = "Today's Session" if mkt_open else "Last Session"
-                        st.markdown(f'<p class="section-label">{session_label} · Intraday Structure</p>', unsafe_allow_html=True)
-                        flags_html = ""
-                        if intra.above_vwap:
-                            flags_html += '<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">▲ Above VWAP</span> '
-                        else:
-                            flags_html += '<span class="play-type-badge" style="background:rgba(255,69,58,0.15); color:#FF453A;">▼ Below VWAP</span> '
-                        if intra.opening_range_break:
-                            flags_html += '<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">ORB Break</span> '
-                        if intra.breakout_of_day:
-                            flags_html += '<span class="play-type-badge" style="background:rgba(191,90,242,0.15); color:#BF5AF2;">New Day High</span> '
-                        st.markdown(
-                            f'<div style="display:flex; gap:16px; align-items:center; flex-wrap:wrap;">'
-                            f'{flags_html}'
-                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">VWAP: <span style="color:{vw_c};">${intra.vwap:.2f}</span></span>'
-                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">Intraday: <span style="color:{"#34C759" if intra.day_change_pct >= 0 else "#FF453A"};">{intra.day_change_pct:+.2f}%</span></span>'
-                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">Vol vs Avg: {intra.volume_vs_avg:.2f}x</span>'
-                            f'<span class="mono" style="font-size:12px; color:rgba(255,255,255,0.4);">AM Range: {intra.morning_range_pct:.1f}%</span>'
-                            f'</div>', unsafe_allow_html=True)
-
-                    # ── After-Hours Setup Score (shows when market closed) ──
-                    if not mkt_open:
-                        st.markdown('<p class="section-label">Overnight Setup Analysis</p>', unsafe_allow_html=True)
-                        setup_pts = 0
-                        setup_notes = []
-
-                        # Technical setup quality
-                        if sig.squeeze_on:
-                            setup_pts += 30
-                            setup_notes.append(("Squeeze Loaded", "BB inside Keltner — volatility expansion imminent at open. This is the #1 overnight setup for gap-ups.", "#BF5AF2"))
-                        if sig.rvol_5 > 1.5:
-                            setup_pts += 20
-                            setup_notes.append(("Volume Building", f"RVol(5d) at {sig.rvol_5:.1f}x — institutional accumulation happened recently. Watch for continuation.", "#34C759"))
-                        if -3 < sig.pct_from_high < 0:
-                            setup_pts += 15
-                            setup_notes.append(("Near Breakout Level", f"Only {abs(sig.pct_from_high):.1f}% from high — any catalyst could trigger a breakout at open.", "#FFD60A"))
-                        if sig.rsi > 40 and sig.rsi < 65:
-                            setup_pts += 10
-                            setup_notes.append(("RSI Sweet Spot", f"RSI at {sig.rsi:.0f} — room to run without being overbought.", "#34C759"))
-                        if sig.direction == "bullish" and sig.confidence > 60:
-                            setup_pts += 15
-                            setup_notes.append(("Model Bullish", f"Ensemble predicts bullish with {sig.confidence}% confidence.", "#0A84FF"))
-
-                        # News catalyst overnight
-                        if news:
-                            bull_news = [n for n in news if n.sentiment == "bullish" and n.importance >= 2]
-                            if bull_news:
-                                setup_pts += 25
-                                setup_notes.append(("Overnight Catalyst", f"{len(bull_news)} high-importance bullish news item(s) — potential gap-up trigger.", "#FF453A"))
-                            elif any(n.sentiment == "bullish" for n in news):
-                                setup_pts += 10
-                                setup_notes.append(("Positive News Flow", "Recent bullish headlines could attract pre-market buyers.", "#34C759"))
-
-                        if profile and profile.short_pct_float > 15:
-                            setup_pts += 10
-                            setup_notes.append(("Short Squeeze Setup", f"{profile.short_pct_float:.1f}% short — any positive catalyst could trigger short covering at open.", "#FF453A"))
-
-                        setup_pts = min(100, setup_pts)
-                        setup_grade = "A+" if setup_pts >= 85 else "A" if setup_pts >= 70 else "B" if setup_pts >= 55 else "C" if setup_pts >= 40 else "D" if setup_pts >= 25 else "F"
-                        sgc = grade_color(setup_grade)
-
-                        st.markdown(
-                            f'<div style="display:flex; gap:16px; align-items:center; margin-bottom:14px;">'
-                            f'<span class="grade-badge" style="background:{sgc}20; color:{sgc}; border:2px solid {sgc}40; width:52px; height:52px; font-size:18px;">{setup_grade}</span>'
-                            f'<div>'
-                            f'<div class="mono" style="font-size:20px; font-weight:700; color:{sgc};">Overnight Setup: {setup_pts}/100</div>'
-                            f'<div style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.4);">{"Strong setup — add to pre-market watchlist" if setup_pts >= 60 else "Moderate — monitor for catalyst" if setup_pts >= 35 else "Weak setup — wait for better entry"}</div>'
-                            f'</div></div>', unsafe_allow_html=True)
-
-                        for note_name, note_desc, note_color in setup_notes:
-                            st.markdown(
-                                f'<div class="driver-row">'
-                                f'<span class="driver-tag" style="background:{note_color}20; color:{note_color};">{note_name}</span>'
-                                f'<span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5;">{note_desc}</span>'
-                                f'</div>', unsafe_allow_html=True)
-
-                        if not setup_notes:
-                            st.markdown('<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.35);">No strong overnight signals detected. Check back closer to pre-market (4 AM ET).</div>', unsafe_allow_html=True)
-
-                    # ── Breakout Factor Breakdown ─────────────
-                    st.markdown('<p class="section-label">Breakout Factor Breakdown</p>', unsafe_allow_html=True)
-                    impact_colors = {
-                        "critical":("#FF453A","rgba(255,69,58,0.15)"), "strong":("#34C759","rgba(52,199,89,0.12)"),
-                        "moderate":("#FFD60A","rgba(255,214,10,0.12)"), "weak":("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"),
-                        "negative":("#FF6961","rgba(255,105,97,0.10)"), "neutral":("rgba(255,255,255,0.3)","rgba(255,255,255,0.04)"),
-                        "signal":("#BF5AF2","rgba(191,90,242,0.12)"),
-                    }
-                    all_factors = list(sig.breakout_factors)
-                    if pro:
-                        all_factors.extend(pro.pro_factors)
-                    for factor, desc, impact in all_factors:
-                        ic, ib = impact_colors.get(impact, ("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"))
-                        st.markdown(f'<div class="driver-row"><span class="driver-tag" style="background:{ib}; color:{ic};">{factor}</span><span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.55); line-height:1.5;">{desc}</span></div>', unsafe_allow_html=True)
-
-                    # ── News Feed ─────────────────────────────
-                    if news:
-                        st.markdown('<p class="section-label">Recent News & Catalysts</p>', unsafe_allow_html=True)
-                        for n in news[:5]:
-                            sent_c = sentiment_color(n.sentiment)
-                            imp_txt = "●" * max(1, n.importance)
-                            age_hrs = (datetime.utcnow() - n.datetime_utc).total_seconds() / 3600
-                            age_text = f"{age_hrs:.0f}h ago" if age_hrs < 48 else f"{age_hrs/24:.0f}d ago"
-                            freshness = "🔴 FRESH" if age_hrs < 6 else "🟡 Recent" if age_hrs < 24 else ""
-                            link = f' · <a href="{n.url}" target="_blank" style="color:rgba(255,255,255,0.3); text-decoration:none; font-size:10px;">↗ open</a>' if n.url else ""
-                            freshness_html = f' <span class="imp-badge" style="background:rgba(255,69,58,0.2); color:#FF453A;">{freshness}</span>' if freshness else ""
-                            st.markdown(
-                                f'<div class="news-item {n.sentiment}">'
-                                f'<div class="news-headline">'
-                                f'<span class="imp-badge" style="background:{sent_c}20; color:{sent_c};">{imp_txt} {n.sentiment}</span>'
-                                f'{freshness_html}'
-                                f' {n.headline}</div>'
-                                f'<div class="news-meta">{n.source} · {age_text}{link}</div>'
-                                f'</div>', unsafe_allow_html=True)
-                    elif FINNHUB_KEY_PRESENT:
-                        st.caption("No recent news for this ticker.")
-                    else:
-                        st.caption("⚠ Set FINNHUB_API_KEY in secrets to enable news feed.")
-
-                    # ── Active Technical Signals ──────────────
-                    st.markdown('<p class="section-label">Active Technical Signals</p>', unsafe_allow_html=True)
-                    for s_text in sig.signals:
-                        st.markdown(f'<div class="sig-item"><span class="sig-dot" style="background:{clr}; box-shadow:0 0 6px {clr}60;"></span>{s_text}</div>', unsafe_allow_html=True)
-
-            # ── Penny Watchlist Summary Table ─────────────────
-            st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-            st.markdown('<p class="section-label">Penny Stock Summary Table</p>', unsafe_allow_html=True)
-            penny_table = []
-            for t in sorted_pennies:
-                s = penny_sigs[t]
-                pr = pro_scores.get(t)
-                pf = profiles.get(t)
-                nw = news_by_ticker.get(t, [])
-                bull_news_count = sum(1 for n in nw if n.sentiment == "bullish") if nw else 0
-                penny_table.append({
-                    "Ticker": t,
-                    "Price": f"${s.price:,.2f}",
-                    "1D %": f"{s.change_1d:+.2f}%",
-                    "5D %": f"{s.change_5d:+.2f}%",
-                    "Dir": s.direction.title(),
-                    "RVol": f"{s.rvol_5:.1f}x",
-                    "Squeeze": "🔥" if s.squeeze_on else "—",
-                    "Float": f"{pf.float_shares_m:.0f}M" if pf and pf.float_shares_m > 0 else "—",
-                    "Short%": f"{pf.short_pct_float:.1f}%" if pf and pf.short_pct_float > 0 else "—",
-                    "News": f"{bull_news_count}↑" if bull_news_count > 0 else "—",
-                    "Score": f"{pr.total_score:.0f}" if pr else f"{s.breakout_score:.0f}",
-                    "Grade": pr.total_grade if pr else s.breakout_grade,
-                    "RSI": f"{s.rsi:.0f}",
-                    "Conf": f"{s.confidence}%",
-                })
-            st.dataframe(pd.DataFrame(penny_table), use_container_width=True, hide_index=True, height=min(500, 40 + len(penny_table) * 38))
-
-
-# ═══ TAB 4: INTRADAY (5m) ═══
-with tab_intraday:
-    if not enable_intraday:
-        st.info("Intraday data is disabled in the sidebar.")
-    elif not intraday_stats_dict:
-        st.warning("No intraday data loaded. This may mean yfinance returned no 5-minute bars — try refreshing.")
-    else:
-        mkt_status = "Live Session" if is_market_hours() else "Last Session (Market Closed)"
-        mkt_note = "" if is_market_hours() else " · Showing most recent trading session data. Signals remain valid for pre-market preparation."
-        st.markdown(f'<p class="section-label">5-Minute Intraday Scanner · {mkt_status}</p>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.6;">'
-            f'VWAP, opening range breakouts, and new-day-high detection. Sorted by % change.{mkt_note}'
-            f'</div>', unsafe_allow_html=True)
-
-        # Sort by intraday move
-        sorted_stats = sorted(intraday_stats_dict.items(), key=lambda x: x[1].day_change_pct, reverse=True)
-
-        for t, stats in sorted_stats:
-            sig = signals.get(t)
-            name, tier, sector = get_ticker_info(t)
-            chg_c = "#34C759" if stats.day_change_pct >= 0 else "#FF453A"
-            vw_c = "#34C759" if stats.above_vwap else "#FF453A"
-
-            with st.container(border=True):
-                hc1, hc2, hc3 = st.columns([2, 2, 1])
-                with hc1:
-                    st.markdown(
-                        f'<div>'
-                        f'<span style="font-family:\'DM Sans\'; font-size:22px; font-weight:700; color:#F5F5F7;">{t}</span>'
-                        f'<span style="font-size:12px; color:rgba(255,255,255,0.35); margin-left:8px;">{name}</span>'
-                        f'</div>'
-                        f'<div style="margin-top:6px;">'
-                        f'<span class="mono" style="font-size:26px; font-weight:600; color:#F5F5F7;">${stats.last_price:,.2f}</span>'
-                        f'<span class="mono" style="font-size:14px; color:{chg_c}; margin-left:10px; font-weight:600;">{stats.day_change_pct:+.2f}%</span>'
-                        f'</div>', unsafe_allow_html=True)
-
-                with hc2:
-                    flags = []
-                    if stats.above_vwap:
-                        flags.append('<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">▲ Above VWAP</span>')
-                    else:
-                        flags.append('<span class="play-type-badge" style="background:rgba(255,69,58,0.15); color:#FF453A;">▼ Below VWAP</span>')
-                    if stats.opening_range_break:
-                        flags.append('<span class="play-type-badge" style="background:rgba(52,199,89,0.15); color:#34C759;">🔥 ORB Break</span>')
-                    if stats.breakout_of_day:
-                        flags.append('<span class="play-type-badge" style="background:rgba(191,90,242,0.15); color:#BF5AF2;">📈 New Day High</span>')
-                    st.markdown(
-                        f'<div style="display:flex; gap:6px; flex-wrap:wrap;">' + "".join(flags) + '</div>'
-                        f'<div style="display:flex; gap:14px; margin-top:10px; font-family:\'JetBrains Mono\'; font-size:11px;">'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Open</span> <span style="color:#F5F5F7;">${stats.day_open:.2f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Hi</span> <span style="color:#F5F5F7;">${stats.day_high:.2f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">Lo</span> <span style="color:#F5F5F7;">${stats.day_low:.2f}</span></div>'
-                        f'<div><span style="color:rgba(255,255,255,0.3);">VWAP</span> <span style="color:{vw_c};">${stats.vwap:.2f}</span></div>'
-                        f'</div>', unsafe_allow_html=True)
-
-                with hc3:
-                    vol_c = "#34C759" if stats.volume_vs_avg > 1.0 else "#F5F5F7"
-                    st.markdown(
-                        f'<div style="text-align:right;">'
-                        f'<div class="kv-label">Cumul. Volume</div>'
-                        f'<div class="mono" style="font-size:16px; font-weight:600; color:{vol_c};">{stats.cumulative_volume/1_000_000:.2f}M</div>'
-                        f'<div class="kv-sub">{stats.volume_vs_avg:.2f}x avg</div>'
-                        f'<div class="kv-sub" style="margin-top:6px;">AM Range: {stats.morning_range_pct:.1f}%</div>'
-                        f'</div>', unsafe_allow_html=True)
-
-                # Mini 5m chart
-                df_5m = intraday_dict.get(t)
-                if df_5m is not None:
-                    df_plot = df_5m.copy()
-                    df_plot.index = pd.to_datetime(df_plot.index)
-                    df_plot["date"] = df_plot.index.date
-                    latest = df_plot["date"].max()
-                    today = df_plot[df_plot["date"] == latest].copy()
-                    if len(today) >= 2:
-                        # Compute VWAP line
-                        typ = (today["High"] + today["Low"] + today["Close"]) / 3
-                        today["vwap"] = (typ * today["Volume"]).cumsum() / today["Volume"].cumsum().replace(0, np.nan)
-
-                        fig = go.Figure()
-                        fig.add_trace(go.Candlestick(
-                            x=idx_to_str(today.index),
-                            open=to_list(today, "Open"),
-                            high=to_list(today, "High"),
-                            low=to_list(today, "Low"),
-                            close=to_list(today, "Close"),
-                            increasing_line_color="#34C759",
-                            decreasing_line_color="#FF453A",
-                            increasing_fillcolor="rgba(52,199,89,0.19)",
-                            decreasing_fillcolor="rgba(255,69,58,0.19)",
-                            name="Price",
-                        ))
-                        fig.add_trace(go.Scatter(
-                            x=idx_to_str(today.index), y=to_list(today, "vwap"),
-                            mode="lines", line=dict(color="#0A84FF", width=1.5, dash="dot"),
-                            name="VWAP", hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
-                        ))
-                        fig.update_layout(
-                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                            font=dict(family="DM Sans, sans-serif", color="rgba(255,255,255,0.5)", size=11),
-                            xaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
-                            yaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
-                            hoverlabel=dict(bgcolor="#1c1c1e", font_size=12, font_family="JetBrains Mono"),
-                            height=220, xaxis_rangeslider_visible=False, showlegend=False,
-                            margin=dict(l=0, r=0, t=10, b=0),
-                        )
-                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"intraday_{t}")
-
-# ═══ TAB 5: DETAIL VIEW ═══
+# ═══ TAB 4: DETAIL + NEWS ═══
 with tab_detail:
     if not signals:
         st.info("No signals.")
     else:
         sel = st.selectbox("Ticker", list(signals.keys()), format_func=lambda t: f"{t} — {get_ticker_info(t)[0]}", key="detail_sel")
         sig = signals[sel]
-        pro = pro_scores.get(sel)
         profile = profiles.get(sel)
         news = news_by_ticker.get(sel, [])
         name, tier, sector = get_ticker_info(sel)
         clr = color_for(sig.direction)
+        pro = pro_scores.get(sel)
 
-        st.markdown(f'<div style="display:flex; align-items:center; gap:14px;"><span style="font-family:\'DM Sans\'; font-size:34px; font-weight:700; color:#F5F5F7;">{sel}</span><span class="badge-{sig.direction}">{icon_for(sig.direction)} {sig.direction.title()}</span></div><p style="font-family:\'DM Sans\'; font-size:14px; color:rgba(255,255,255,0.35);">{name} · {tier} · {sector}</p>', unsafe_allow_html=True)
+        st.markdown(f'<div style="display:flex; align-items:center; gap:14px;"><span style="font-family:\'DM Sans\'; font-size:32px; font-weight:700; color:#F5F5F7;">{sel}</span><span class="badge {"badge-bull" if sig.direction=="bullish" else "badge-bear" if sig.direction=="bearish" else "badge-neut"}">{icon_for(sig.direction)} {sig.direction.title()}</span></div><p style="font-family:\'DM Sans\'; font-size:14px; color:rgba(255,255,255,0.35);">{name} · {tier} · {sector}</p>', unsafe_allow_html=True)
 
         m1,m2,m3,m4,m5,m6 = st.columns(6)
         m1.metric("Price", f"${sig.price:,.2f}")
         m2.metric("1D", f"{sig.change_1d:+.2f}%")
         m3.metric("Confidence", f"{sig.confidence}%")
-        m4.metric("RVol(5d)", f"{sig.rvol_5:.1f}x")
-        if pro:
-            m5.metric("Pro Score", f"{pro.total_grade} ({pro.total_score:.0f})")
-        else:
-            m5.metric("Score", f"{sig.breakout_grade} ({sig.breakout_score:.0f})")
-        m6.metric("Model Acc.", f"{sig.accuracy}%")
+        m4.metric("RVol", f"{sig.rvol_5:.1f}x")
+        grade = pro.total_grade if pro else sig.breakout_grade
+        score = pro.total_score if pro else sig.breakout_score
+        m5.metric("Score", f"{grade} ({score:.0f})")
+        m6.metric("Accuracy", f"{sig.accuracy}%")
 
-        # Profile panel (new)
-        if profile and (profile.float_shares_m > 0 or profile.market_cap_m > 0):
-            st.markdown('<p class="section-label">Company Profile</p>', unsafe_allow_html=True)
-            p1, p2, p3, p4 = st.columns(4)
-            p1.metric("Market Cap", f"${profile.market_cap_m:,.0f}M" if profile.market_cap_m > 0 else "—")
-            p2.metric("Float", f"{profile.float_shares_m:.1f}M" if profile.float_shares_m > 0 else "—")
-            p3.metric("Short % Float", f"{profile.short_pct_float:.1f}%" if profile.short_pct_float > 0 else "—")
-            p4.metric("Short Ratio", f"{profile.short_ratio:.1f}" if profile.short_ratio > 0 else "—")
+        if profile and profile.float_shares_m > 0:
+            p1,p2,p3,p4 = st.columns(4)
+            p1.metric("Float", f"{profile.float_shares_m:.1f}M")
+            p2.metric("Mkt Cap", f"${profile.market_cap_m:,.0f}M")
+            p3.metric("Short%", f"{profile.short_pct_float:.1f}%")
+            p4.metric("Short Ratio", f"{profile.short_ratio:.1f}")
 
-        # Chart + indicators
-        ch_col, in_col = st.columns([2, 1])
-        with ch_col:
+        chart_col, info_col = st.columns([2, 1])
+        with chart_col:
             df = data_dict.get(sel)
             if df is not None:
                 x_vals = idx_to_str(df.index)
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
-                fig.add_trace(go.Candlestick(
-                    x=x_vals,
-                    open=to_list(df, "Open"),
-                    high=to_list(df, "High"),
-                    low=to_list(df, "Low"),
-                    close=to_list(df, "Close"),
-                    increasing_line_color="#34C759", decreasing_line_color="#FF453A",
-                    increasing_fillcolor="rgba(52,199,89,0.19)", decreasing_fillcolor="rgba(255,69,58,0.19)",
-                ), row=1, col=1)
-                close_arr = to_list(df, "Close")
-                open_arr = to_list(df, "Open")
-                vol_arr = to_list(df, "Volume")
-                vc = ["#34C759" if c >= o else "#FF453A" for c, o in zip(close_arr, open_arr)]
-                fig.add_trace(go.Bar(x=x_vals, y=vol_arr, marker_color=vc, opacity=0.4), row=2, col=1)
-                fig.update_layout(**PLOTLY_LAYOUT, height=420, showlegend=False, xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"detail_{sel}")
+                fig.add_trace(go.Candlestick(x=x_vals, open=to_list(df,"Open"), high=to_list(df,"High"), low=to_list(df,"Low"), close=to_list(df,"Close"), increasing_line_color="#34C759", decreasing_line_color="#FF453A", increasing_fillcolor="rgba(52,199,89,0.19)", decreasing_fillcolor="rgba(255,69,58,0.19)"), row=1, col=1)
+                c_arr, o_arr, v_arr = to_list(df,"Close"), to_list(df,"Open"), to_list(df,"Volume")
+                vc = ["#34C759" if c>=o else "#FF453A" for c,o in zip(c_arr, o_arr)]
+                fig.add_trace(go.Bar(x=x_vals, y=v_arr, marker_color=vc, opacity=0.4), row=2, col=1)
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=11), margin=dict(l=0,r=0,t=30,b=0), xaxis=dict(gridcolor="rgba(255,255,255,0.04)"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)"), height=400, showlegend=False, xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"detail_chart_{sel}")
 
-        with in_col:
-            st.markdown('<p class="section-label">Indicators</p>', unsafe_allow_html=True)
-            for label, val in [("RSI (14)", f"{sig.rsi}"), ("RVol (5d)", f"{sig.rvol_5}x"), ("RVol (20d)", f"{sig.rvol_20}x"), ("Volatility (ATR)", f"{sig.volatility}%"), ("MACD Hist", f"{sig.macd_hist:+.4f}"), ("P(up)", f"{sig.probability:.1%}")]:
-                st.markdown(f'<div style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.04);"><div style="display:flex; justify-content:space-between;"><span style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.5);">{label}</span><span class="mono" style="font-size:14px; font-weight:600; color:#F5F5F7;">{val}</span></div></div>', unsafe_allow_html=True)
-
-            st.markdown('<p class="section-label">Active Signals</p>', unsafe_allow_html=True)
+        with info_col:
+            for label, val in [("RSI", f"{sig.rsi}"), ("RVol (5d)", f"{sig.rvol_5}x"), ("Volatility", f"{sig.volatility}%"), ("MACD Hist", f"{sig.macd_hist:+.4f}"), ("P(up)", f"{sig.probability:.1%}")]:
+                st.markdown(f'<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.04); display:flex; justify-content:space-between;"><span style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.5);">{label}</span><span class="mono" style="font-size:13px; font-weight:600; color:#F5F5F7;">{val}</span></div>', unsafe_allow_html=True)
+            st.markdown('<p class="section-label">Signals</p>', unsafe_allow_html=True)
             for s in sig.signals:
-                st.markdown(f'<div class="sig-item"><span class="sig-dot" style="background:{clr}; box-shadow:0 0 6px {clr}60;"></span>{s}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div style="display:flex; align-items:center; gap:8px; padding:4px 0; font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.6);"><span style="width:5px; height:5px; border-radius:50%; background:{clr}; box-shadow:0 0 4px {clr}60; flex-shrink:0;"></span>{s}</div>', unsafe_allow_html=True)
 
-        # News feed (new)
+        # News section
         if news:
-            st.markdown('<p class="section-label">Recent News & Catalysts</p>', unsafe_allow_html=True)
-            for n in news[:8]:
-                sent_c = sentiment_color(n.sentiment)
-                imp_txt = "●" * max(1, n.importance)
-                link = f'<a href="{n.url}" target="_blank" style="color:rgba(255,255,255,0.3); text-decoration:none; font-size:10px;">↗ open</a>' if n.url else ""
-                st.markdown(
-                    f'<div class="news-item {n.sentiment}">'
-                    f'<div class="news-headline">'
-                    f'<span class="imp-badge" style="background:{sent_c}20; color:{sent_c};">{imp_txt} {n.sentiment}</span>'
-                    f'{n.headline}</div>'
-                    f'<div class="news-meta">{n.source} · {n.datetime_utc.strftime("%Y-%m-%d %H:%M UTC")} · {link}</div>'
-                    f'<div class="news-summary">{n.summary[:250]}{"..." if len(n.summary) > 250 else ""}</div>'
-                    f'</div>', unsafe_allow_html=True)
-        elif FINNHUB_KEY_PRESENT:
-            st.caption("No recent news available for this ticker.")
-        else:
-            st.caption("⚠ Add a FINNHUB_API_KEY in Streamlit secrets to enable news feed.")
+            st.markdown('<p class="section-label">News & Catalysts</p>', unsafe_allow_html=True)
+            ncols = st.columns(2)
+            for ni, n in enumerate(news[:6]):
+                sc = sentiment_color(n.sentiment)
+                hrs = (datetime.utcnow() - n.datetime_utc).total_seconds() / 3600
+                fresh = "🔴" if hrs < 12 else "🟡" if hrs < 48 else ""
+                link = f' <a href="{n.url}" target="_blank" style="color:rgba(255,255,255,0.25); text-decoration:none; font-size:9px;">↗</a>' if n.url else ""
+                with ncols[ni % 2]:
+                    st.markdown(
+                        f'<div class="news-card {n.sentiment}">'
+                        f'<div style="font-family:\'DM Sans\'; font-size:12px; font-weight:600; color:#F5F5F7; line-height:1.4;">'
+                        f'<span style="font-family:\'JetBrains Mono\'; font-size:9px; padding:1px 5px; border-radius:3px; background:{sc}18; color:{sc}; margin-right:6px;">{n.sentiment}</span>'
+                        f'{fresh} {n.headline[:90]}{"..." if len(n.headline)>90 else ""}{link}</div>'
+                        f'<div style="font-family:\'JetBrains Mono\'; font-size:9px; color:rgba(255,255,255,0.25); margin-top:4px;">{n.source} · {hrs:.0f}h ago</div>'
+                        f'</div>', unsafe_allow_html=True)
+        elif not FINNHUB_KEY_PRESENT:
+            st.caption("Set FINNHUB_API_KEY for news.")
 
-# ═══ TAB 6: OPTIONS PLAYS ═══
+# ═══ TAB 5: OPTIONS ═══
 with tab_options:
     if not signals:
         st.info("No signals.")
     else:
-        oc1, oc2, oc3 = st.columns([2, 1, 1])
+        oc1,oc2 = st.columns([2,1])
         with oc1:
             ot = st.selectbox("Ticker", list(signals.keys()), format_func=lambda t: f"{t} — {signals[t].direction.title()} ({signals[t].confidence}%)", key="opt_sel")
         with oc2:
-            rf = st.selectbox("Risk", ["All", "Conservative", "Moderate", "Aggressive"], key="opt_risk")
-        with oc3:
-            tf = st.selectbox("Type", ["All", "Directional", "Neutral", "Volatility"], key="opt_type")
+            rf = st.selectbox("Risk", ["All","Conservative","Moderate","Aggressive"], key="opt_risk")
 
         @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice, 120), show_spinner=False)
         def get_plays(ticker, sig_hash, lb):
-            s = signals.get(ticker)
-            d = data_dict.get(ticker)
+            s, d = signals.get(ticker), data_dict.get(ticker)
             return generate_options_plays(s, d) if s and d is not None else []
 
         sig = signals[ot]
         plays = get_plays(ot, f"{ot}_{sig.confidence}_{sig.probability}", lookback)
         if rf != "All": plays = [p for p in plays if p.risk_tier == rf.lower()]
-        if tf != "All":
-            if tf == "Directional": plays = [p for p in plays if "directional" in p.strategy_type]
-            else: plays = [p for p in plays if p.strategy_type == tf.lower()]
 
         if not plays:
-            st.warning(f"No plays for {ot} with current filters.")
+            st.warning(f"No plays for {ot}.")
         else:
             for pi, play in enumerate(plays):
                 tc = {"directional_bullish":("#34C759","rgba(52,199,89,0.12)"),"directional_bearish":("#FF453A","rgba(255,69,58,0.12)"),"neutral":("#0A84FF","rgba(10,132,255,0.12)"),"volatility":("#BF5AF2","rgba(191,90,242,0.12)")}
-                t_clr, t_bg = tc.get(play.strategy_type, ("#FFD60A","rgba(255,214,10,0.12)"))
-                cc = "bullish" if "bullish" in play.strategy_type else "bearish" if "bearish" in play.strategy_type else "volatility" if play.strategy_type == "volatility" else "neutral"
+                t_clr,t_bg = tc.get(play.strategy_type,("#FFD60A","rgba(255,214,10,0.12)"))
+                cc = "bullish" if "bullish" in play.strategy_type else "bearish" if "bearish" in play.strategy_type else "volatility" if play.strategy_type=="volatility" else "neutral"
                 st.markdown(f'<div class="play-card {cc}">', unsafe_allow_html=True)
-                pc1, pc2 = st.columns([3, 1])
+                pc1,pc2 = st.columns([3,1])
                 with pc1:
-                    st.markdown(f'<div class="play-strategy">{play.strategy_name}</div><div style="display:flex; gap:8px; margin-top:4px;"><span class="play-type-badge" style="background:{t_bg}; color:{t_clr};">{play.strategy_type.replace("_"," ")}</span><span class="play-type-badge" style="background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.5);">{play.risk_tier}</span></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="font-family:\'DM Sans\'; font-size:22px; font-weight:700; color:#F5F5F7;">{play.strategy_name}</div><div style="display:flex; gap:6px; margin-top:4px;"><span class="badge" style="background:{t_bg}; color:{t_clr}; font-family:\'JetBrains Mono\'; font-size:10px;">{play.strategy_type.replace("_"," ")}</span><span class="badge" style="background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.5); font-family:\'JetBrains Mono\'; font-size:10px;">{play.risk_tier}</span></div>', unsafe_allow_html=True)
                 with pc2:
-                    st.markdown(f'<div style="text-align:right;"><div class="kv-label">Prob of Profit</div><div class="mono" style="font-size:28px; font-weight:700; color:{t_clr};">{play.probability_of_profit}%</div></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="text-align:right;"><div class="kv-label">PoP</div><div class="mono" style="font-size:26px; font-weight:700; color:{t_clr};">{play.probability_of_profit}%</div></div>', unsafe_allow_html=True)
 
+                # CI bar
                 pt = play.price_target
                 fr = pt.target_high - pt.target_low
-                cp = max(5, min(95, ((pt.current - pt.target_low) / fr * 100) if fr > 0 else 50))
-                mp = max(5, min(95, ((pt.target_mid - pt.target_low) / fr * 100) if fr > 0 else 50))
-                st.markdown(f'<p class="section-label">90% CI Target</p><div class="ci-bar-container"><div class="ci-bar-fill" style="left:10%; right:10%; background:{t_clr};"></div><div class="ci-marker" style="left:10%; color:{t_clr}; top:25%;">${pt.target_low:.0f}</div><div class="ci-marker" style="left:{cp}%; color:#F5F5F7; top:75%;">NOW ${pt.current:.0f}</div><div class="ci-marker" style="left:90%; color:{t_clr}; top:25%;">${pt.target_high:.0f}</div></div>', unsafe_allow_html=True)
+                cp = max(5, min(95, ((pt.current-pt.target_low)/fr*100) if fr>0 else 50))
+                st.markdown(f'<div class="ci-bar-container"><div class="ci-bar-fill" style="left:10%; right:10%; background:{t_clr};"></div><div class="ci-marker" style="left:10%; color:{t_clr}; top:25%;">${pt.target_low:.0f}</div><div class="ci-marker" style="left:{cp}%; color:#F5F5F7; top:75%;">NOW ${pt.current:.0f}</div><div class="ci-marker" style="left:90%; color:{t_clr}; top:25%;">${pt.target_high:.0f}</div></div>', unsafe_allow_html=True)
 
-                st.markdown('<p class="section-label">Legs</p>', unsafe_allow_html=True)
+                # Legs
                 for leg in play.legs:
-                    dc = "#34C759" if leg.direction == "buy" else "#FF6961"
-                    db = "rgba(52,199,89,0.15)" if leg.direction == "buy" else "rgba(255,105,97,0.15)"
-                    st.markdown(f'<div class="leg-row"><span class="leg-direction" style="background:{db}; color:{dc};">{leg.direction}</span><span style="color:#F5F5F7; font-weight:600;">{leg.option_type.upper()}</span><span style="color:rgba(255,255,255,0.4);">K</span><span style="color:#F5F5F7; font-weight:600;">${leg.strike:.0f}</span><span style="color:rgba(255,255,255,0.4);">Prem</span><span style="color:#F5F5F7;">${leg.estimated_premium:.2f}</span><span style="color:rgba(255,255,255,0.3); margin-left:auto;">Δ{leg.delta:.2f} Γ{leg.gamma:.3f} Θ{leg.theta:.3f}</span></div>', unsafe_allow_html=True)
+                    dc = "#34C759" if leg.direction=="buy" else "#FF6961"
+                    db = "rgba(52,199,89,0.15)" if leg.direction=="buy" else "rgba(255,105,97,0.15)"
+                    st.markdown(f'<div class="leg-row"><span class="leg-dir" style="background:{db}; color:{dc};">{leg.direction}</span><span style="color:#F5F5F7; font-weight:600;">{leg.option_type.upper()}</span><span style="color:rgba(255,255,255,0.4);">K</span><span style="color:#F5F5F7;">${leg.strike:.0f}</span><span style="color:rgba(255,255,255,0.4);">Prem</span><span style="color:#F5F5F7;">${leg.estimated_premium:.2f}</span><span style="color:rgba(255,255,255,0.3); margin-left:auto;">Δ{leg.delta:.2f} Θ{leg.theta:.3f}</span></div>', unsafe_allow_html=True)
 
-                st.markdown('<p class="section-label">Trade Plan</p>', unsafe_allow_html=True)
-                is_cr = play.strategy_type == "neutral" or "Short" in play.strategy_name
-                gi = [(("Credit" if is_cr else "Debit"), f"${play.entry_price:.2f}"), ("Max Loss", f"${play.max_loss:.0f}"), ("Max Gain", "Unlimited" if play.max_gain == -1 else f"${play.max_gain:.0f}"), ("R/R", f"{play.risk_reward_ratio:.1f}x"), ("BE", f"${play.break_even:.2f}"), ("PoP", f"{play.probability_of_profit}%")]
+                # Trade plan grid
+                is_cr = play.strategy_type=="neutral" or "Short" in play.strategy_name
+                gi = [(("Credit" if is_cr else "Debit"),f"${play.entry_price:.2f}"),("Max Loss",f"${play.max_loss:.0f}"),("Max Gain","∞" if play.max_gain==-1 else f"${play.max_gain:.0f}"),("R/R",f"{play.risk_reward_ratio:.1f}x"),("BE",f"${play.break_even:.2f}"),("PoP",f"{play.probability_of_profit}%")]
                 gh = '<div class="kv-grid">'
-                for l, v in gi:
-                    gh += f'<div class="kv-cell"><div class="kv-label">{l}</div><div class="kv-value">{v}</div></div>'
-                st.markdown(gh + '</div>', unsafe_allow_html=True)
+                for l,v in gi: gh += f'<div class="kv-cell"><div class="kv-label">{l}</div><div class="kv-value">{v}</div></div>'
+                st.markdown(gh+'</div>', unsafe_allow_html=True)
 
-                st.markdown(f'<p class="section-label">Timing</p><div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;"><div class="kv-cell"><div class="kv-label">Entry</div><div style="font-size:13px; color:rgba(255,255,255,0.6); margin-top:4px;">{play.entry_timing}</div></div><div class="kv-cell"><div class="kv-label">Exit</div><div style="font-size:13px; color:rgba(255,255,255,0.6); margin-top:4px;">{play.exit_timing}</div></div></div>', unsafe_allow_html=True)
-
-                # ── Hold Duration & Theta ──────────────────────
+                # Hold duration
                 if play.hold_duration:
-                    st.markdown('<p class="section-label">How Long to Hold</p>', unsafe_allow_html=True)
                     st.markdown(
-                        f'<div style="display:grid; grid-template-columns:1fr 2fr; gap:12px;">'
-                        f'<div class="kv-cell" style="display:flex; flex-direction:column; justify-content:center; align-items:center;">'
-                        f'<div class="kv-label">Recommended Hold</div>'
-                        f'<div class="mono" style="font-size:22px; font-weight:700; color:{t_clr}; margin-top:6px;">{play.hold_duration}</div>'
-                        f'</div>'
-                        f'<div class="kv-cell">'
-                        f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.hold_reasoning}</div>'
-                        f'</div></div>', unsafe_allow_html=True)
+                        f'<div style="display:grid; grid-template-columns:auto 1fr; gap:12px; margin-top:12px;">'
+                        f'<div class="kv-cell" style="text-align:center;"><div class="kv-label">Hold</div><div class="mono" style="font-size:18px; font-weight:700; color:{t_clr};">{play.hold_duration}</div></div>'
+                        f'<div class="kv-cell"><div style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.55); line-height:1.6;">{play.hold_reasoning}</div></div></div>', unsafe_allow_html=True)
 
-                    # Theta warning
-                    if play.theta_decay_warning:
-                        st.markdown(
-                            f'<div style="background:rgba(255,159,10,0.08); border:1px solid rgba(255,159,10,0.2); border-radius:10px; padding:14px 18px; margin-top:10px;">'
-                            f'<div style="font-family:\'JetBrains Mono\'; font-size:10px; font-weight:600; color:#FF9F0A; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">⏳ Theta Decay Impact</div>'
-                            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.theta_decay_warning}</div>'
-                            f'</div>', unsafe_allow_html=True)
+                if play.theta_decay_warning:
+                    st.markdown(f'<div style="background:rgba(255,159,10,0.06); border:1px solid rgba(255,159,10,0.15); border-radius:8px; padding:10px 14px; margin-top:8px;"><span style="font-family:\'JetBrains Mono\'; font-size:9px; font-weight:600; color:#FF9F0A; text-transform:uppercase;">⏳ Theta</span> <span style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.55);">{play.theta_decay_warning}</span></div>', unsafe_allow_html=True)
 
-                    # Optimal exit
-                    if play.optimal_exit_scenario:
-                        st.markdown(
-                            f'<div style="background:rgba(52,199,89,0.06); border:1px solid rgba(52,199,89,0.15); border-radius:10px; padding:14px 18px; margin-top:10px;">'
-                            f'<div style="font-family:\'JetBrains Mono\'; font-size:10px; font-weight:600; color:#34C759; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">🎯 Optimal Exit Scenario</div>'
-                            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.optimal_exit_scenario}</div>'
-                            f'</div>', unsafe_allow_html=True)
-
-                # ── Price Movement Insights ────────────────────
                 if play.price_drivers:
-                    st.markdown('<p class="section-label">What\'s Driving the Price</p>', unsafe_allow_html=True)
-                    for factor, emoji, desc in play.price_drivers:
-                        st.markdown(
-                            f'<div class="driver-row">'
-                            f'<span style="font-size:16px; flex-shrink:0;">{emoji}</span>'
-                            f'<div>'
-                            f'<div style="font-family:\'DM Sans\'; font-size:13px; font-weight:600; color:#F5F5F7;">{factor}</div>'
-                            f'<div style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.5); margin-top:2px; line-height:1.5;">{desc}</div>'
-                            f'</div></div>', unsafe_allow_html=True)
+                    st.markdown('<p class="section-label">Price Drivers</p>', unsafe_allow_html=True)
+                    for factor, emoji, desc in play.price_drivers[:4]:
+                        st.markdown(f'<div class="driver-row"><span style="font-size:14px;">{emoji}</span><div><div style="font-family:\'DM Sans\'; font-size:12px; font-weight:600; color:#F5F5F7;">{factor}</div><div style="font-family:\'DM Sans\'; font-size:11px; color:rgba(255,255,255,0.45); margin-top:1px;">{desc}</div></div></div>', unsafe_allow_html=True)
 
-                st.markdown(f'<p class="section-label">Thesis</p><div class="thesis-block">{play.thesis}</div>', unsafe_allow_html=True)
-
-                st.markdown('<p class="section-label">Technical Drivers</p>', unsafe_allow_html=True)
-                dic = {"primary":("#0A84FF","rgba(10,132,255,0.12)"),"strong":("#34C759","rgba(52,199,89,0.12)"),"supportive":("#30D158","rgba(48,209,88,0.10)"),"moderate":("#FFD60A","rgba(255,214,10,0.12)"),"caution":("#FF9F0A","rgba(255,159,10,0.12)"),"neutral":("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"),"context":("#BF5AF2","rgba(191,90,242,0.12)"),"signal":("#5AC8FA","rgba(90,200,250,0.12)")}
-                for f, d, i in play.drivers:
-                    ic, ib = dic.get(i, ("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"))
-                    st.markdown(f'<div class="driver-row"><span class="driver-tag" style="background:{ib}; color:{ic};">{f}</span><span style="font-size:13px; color:rgba(255,255,255,0.55);">{d}</span></div>', unsafe_allow_html=True)
-
-                st.markdown('<p class="section-label">Risks</p>', unsafe_allow_html=True)
-                for r in play.risks:
-                    st.markdown(f'<div class="risk-item"><span style="color:#FF9F0A;">⚠</span>{r}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="thesis-block" style="margin-top:10px;">{play.thesis}</div>', unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-# ═══ TAB 7: HEATMAP ═══
+# ═══ TAB 6: HEATMAP ═══
 with tab_heatmap:
     if not signals:
         st.info("No data.")
     else:
-        def get_score(t):
-            return pro_scores[t].total_score if pro_scores else signals[t].breakout_score
-        def get_grade(t):
-            return pro_scores[t].total_grade if pro_scores else signals[t].breakout_grade
-
-        ts = sorted(signals.keys(), key=get_score, reverse=True)
+        def gs(t): return pro_scores[t].total_score if t in pro_scores else signals[t].breakout_score
+        def gg(t): return pro_scores[t].total_grade if t in pro_scores else signals[t].breakout_grade
+        ts = sorted(signals.keys(), key=gs, reverse=True)
         max_y = 150 if pro_scores else 100
 
-        st.markdown('<p class="section-label">Breakout Score Heatmap</p>', unsafe_allow_html=True)
-        scores = [get_score(t) for t in ts]
-        sc = [grade_color(get_grade(t)) for t in ts]
+        scores = [gs(t) for t in ts]
+        sc = [grade_color(gg(t)) for t in ts]
         fig = go.Figure(go.Bar(x=ts, y=scores, marker_color=sc, text=[f"{s:.0f}" for s in scores], textposition="outside", textfont=dict(family="JetBrains Mono", size=11, color="rgba(255,255,255,0.5)")))
-        fig.update_layout(**{**PLOTLY_LAYOUT, "yaxis": dict(range=[0, max_y * 1.05], gridcolor="rgba(255,255,255,0.04)")}, height=350)
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="heatmap_main")
+        fig.update_layout(**{**dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=11), margin=dict(l=0,r=0,t=30,b=0), xaxis=dict(gridcolor="rgba(255,255,255,0.04)")), "yaxis": dict(range=[0,max_y*1.05], gridcolor="rgba(255,255,255,0.04)")}, height=320)
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="heatmap_bar")
 
-        st.markdown('<p class="section-label">Full Dashboard</p>', unsafe_allow_html=True)
         td = []
         for t in ts:
             s = signals[t]
             n, tier, sec = get_ticker_info(t)
-            pro = pro_scores.get(t)
-            profile = profiles.get(t)
-            row = {
-                "Ticker": t, "Name": n, "Tier": tier, "Sector": sec,
-                "Dir": s.direction.title(), "Conf": f"{s.confidence}%",
-                "Price": f"${s.price:,.2f}", "1D": f"{s.change_1d:+.2f}%",
-                "RVol(5)": f"{s.rvol_5:.1f}x",
-                "Float": f"{profile.float_shares_m:.1f}M" if profile and profile.float_shares_m > 0 else "—",
-                "Short%": f"{profile.short_pct_float:.1f}%" if profile and profile.short_pct_float > 0 else "—",
-                "Squeeze": "🔥" if s.squeeze_on else "—",
-                "Score": f"{get_score(t):.0f}",
-                "Grade": get_grade(t),
-            }
-            if t in intraday_stats_dict:
-                row["VWAP"] = "▲" if intraday_stats_dict[t].above_vwap else "▼"
-                row["Intraday"] = f"{intraday_stats_dict[t].day_change_pct:+.2f}%"
+            pf = profiles.get(t)
+            intra = intraday_stats_dict.get(t)
+            row = {"Ticker":t, "Name":n, "Dir":s.direction.title(), "Price":f"${s.price:,.2f}",
+                "1D":f"{s.change_1d:+.2f}%", "RVol":f"{s.rvol_5:.1f}x",
+                "Float":f"{pf.float_shares_m:.0f}M" if pf and pf.float_shares_m>0 else "—",
+                "Short%":f"{pf.short_pct_float:.1f}%" if pf and pf.short_pct_float>0 else "—",
+                "Score":f"{gs(t):.0f}", "Grade":gg(t), "RSI":f"{s.rsi:.0f}"}
+            if intra: row["VWAP"] = "▲" if intra.above_vwap else "▼"
             td.append(row)
-        st.dataframe(pd.DataFrame(td), use_container_width=True, hide_index=True, height=500)
+        st.dataframe(pd.DataFrame(td), use_container_width=True, hide_index=True, height=450)
 
-st.markdown('<div style="height:32px"></div><p style="font-family:sans-serif; font-size:11px; color:rgba(255,255,255,0.12); text-align:center; padding:24px 0; line-height:1.6;">Signal · yfinance (price/intraday/float) + Finnhub (news/profile). Educational use only. Not financial advice.</p>', unsafe_allow_html=True)
+st.markdown('<div style="height:24px"></div><p style="font-family:sans-serif; font-size:10px; color:rgba(255,255,255,0.1); text-align:center; padding:16px 0;">Signal · yfinance + Finnhub · Educational use only. Not financial advice.</p>', unsafe_allow_html=True)
