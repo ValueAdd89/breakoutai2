@@ -34,7 +34,7 @@ from models.predictor import predict_batch_parallel, Signal
 from models.pro_scorer import compute_pro_breakout
 from models.options_engine import generate_options_plays
 
-st.set_page_config(page_title="Signal Pro", page_icon="◉", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Signal Pro", page_icon="◉", layout="wide", initial_sidebar_state="expanded")
 FINNHUB_KEY_PRESENT = bool(_get_api_key())
 
 # ─── Sidebar ─────────────────────────────────────────────────────
@@ -272,6 +272,20 @@ progress = st.progress(0, text="Loading market data...")
 data_dict, signals = load_and_predict(tuple(selected_tickers), lookback)
 progress.progress(40, text="Models complete.")
 
+# Diagnostic: if no signals loaded, show what happened
+if not signals:
+    progress.empty()
+    st.error(f"⚠ No data loaded for {len(selected_tickers)} tickers. This usually means yfinance is temporarily unavailable or all tickers failed to download.")
+    st.markdown(f"**Tickers attempted:** {', '.join(selected_tickers[:20])}")
+    st.markdown(f"**Data returned for:** {len(data_dict)} tickers")
+    if data_dict:
+        st.markdown(f"**Tickers with data:** {', '.join(data_dict.keys())}")
+        st.markdown("Data was fetched but models produced no signals. This can happen if the data is too short (need 60+ daily bars).")
+    else:
+        st.markdown("No market data was returned by yfinance. This is likely a temporary API issue. Try refreshing in a few seconds.")
+    st.button("🔄 Retry", on_click=st.cache_data.clear)
+    st.stop()
+
 intraday_dict, intraday_stats_dict = {}, {}
 if enable_intraday:
     progress.progress(55, text="Fetching intraday bars...")
@@ -365,12 +379,20 @@ with tab_overview:
 
 # ═══ TAB 2: PENNY RUNNERS (card grid with runner pattern analysis) ═══
 with tab_penny:
+    # Show penny stocks if available, otherwise score ALL tickers with the runner model
     penny_sigs = {t: s for t, s in signals.items() if is_penny_stock(t)}
     if not penny_sigs:
-        st.warning("No penny stocks in watchlist. Select 'All' or 'Penny/Small' in sidebar.")
+        # No dedicated penny stocks — score all tickers anyway
+        penny_sigs = dict(signals)
+        penny_mode_label = "All Tickers (no penny stocks in watchlist — scoring all with runner model)"
     else:
-        mkt_label = "Live Market" if mkt else "After-Hours Prep"
-        st.markdown(f'<p class="section-label">🚀 {mkt_label} · Penny Runner Scanner</p>', unsafe_allow_html=True)
+        penny_mode_label = f"{len(penny_sigs)} Penny / Small-Cap Stocks"
+    
+    if not penny_sigs:
+        st.warning("No signals loaded. Check the sidebar for configuration.")
+    else:
+        mkt_label = "Live Market" if is_market_hours() else "After-Hours Prep"
+        st.markdown(f'<p class="section-label">🚀 {mkt_label} · {penny_mode_label}</p>', unsafe_allow_html=True)
         st.markdown(
             '<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.4); margin-bottom:16px; line-height:1.7;">'
             'Models what drives small stocks from <span style="color:#FF453A; font-weight:600;">$0.30 → $20+</span>: '

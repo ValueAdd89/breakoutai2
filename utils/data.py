@@ -90,7 +90,7 @@ def _clean_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str, pd.DataFrame]:
+def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str], min_bars: int = 40) -> dict[str, pd.DataFrame]:
     results = {}
     if raw_df.empty:
         return results
@@ -102,15 +102,15 @@ def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str,
                     tdf = raw_df.xs(t, level=1, axis=1).copy()
                     tdf = _clean_cols(tdf)
                     tdf.dropna(subset=["Close"], inplace=True)
-                    if len(tdf) > 60:
+                    if len(tdf) >= min_bars:
                         results[t] = tdf
                 except Exception:
                     continue
     else:
-        if len(tickers) == 1 and len(raw_df) > 60:
+        if len(tickers) == 1 and len(raw_df) >= min_bars:
             df = _clean_cols(raw_df.copy())
             df.dropna(subset=["Close"], inplace=True)
-            if len(df) > 60:
+            if len(df) >= min_bars:
                 results[tickers[0]] = df
     return results
 
@@ -118,34 +118,38 @@ def _split_multi_download(raw_df: pd.DataFrame, tickers: list[str]) -> dict[str,
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_batch_data(tickers: tuple, period: str = "6mo") -> dict[str, pd.DataFrame]:
     ticker_list = list(tickers)
+    MIN_BARS = 40  # lowered from 60 for shorter lookbacks
+    
+    # Phase 1: batch download
     try:
         raw = yf.download(
             " ".join(ticker_list), period=period, interval="1d",
-            progress=False, auto_adjust=True, timeout=15, threads=True,
+            progress=False, auto_adjust=True, timeout=20, threads=True,
         )
-        results = _split_multi_download(raw, ticker_list)
+        results = _split_multi_download(raw, ticker_list, min_bars=MIN_BARS)
     except Exception:
         results = {}
 
+    # Phase 2: retry failures individually
     failed = [t for t in ticker_list if t not in results]
     if failed:
         def _fetch_one(ticker):
             try:
                 df = yf.download(ticker, period=period, interval="1d",
-                                 progress=False, auto_adjust=True, timeout=8)
+                                 progress=False, auto_adjust=True, timeout=10)
                 if df.empty:
                     return ticker, None
                 df = _clean_cols(df)
                 df.dropna(subset=["Close"], inplace=True)
-                return (ticker, df) if len(df) > 60 else (ticker, None)
+                return (ticker, df) if len(df) >= MIN_BARS else (ticker, None)
             except Exception:
                 return ticker, None
 
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = {pool.submit(_fetch_one, t): t for t in failed}
-            for future in as_completed(futures, timeout=25):
+            for future in as_completed(futures, timeout=30):
                 try:
-                    t, df = future.result(timeout=10)
+                    t, df = future.result(timeout=12)
                     if df is not None:
                         results[t] = df
                 except Exception:

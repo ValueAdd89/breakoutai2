@@ -50,7 +50,7 @@ class Signal:
 def predict_signal(ticker: str, df: pd.DataFrame) -> Signal | None:
     try:
         feat_df = compute_features(df)
-        if len(feat_df) < 80:
+        if len(feat_df) < 50:
             return None
 
         X = feat_df[FEATURE_COLS].values
