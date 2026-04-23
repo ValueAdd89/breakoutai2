@@ -146,6 +146,13 @@ class OptionsPlay:
     suggested_allocation: str  # e.g. "1-3% of portfolio"
     ideal_account_size: str    # e.g. "$10k+"
 
+    # Price movement insights
+    price_drivers: list = field(default_factory=list)  # list of (factor, direction, description)
+    hold_duration: str = ""                  # recommended hold period
+    hold_reasoning: str = ""                 # why this duration
+    theta_decay_warning: str = ""            # time decay impact
+    optimal_exit_scenario: str = ""          # best-case exit narrative
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Black-Scholes approximation
@@ -347,6 +354,19 @@ def generate_options_plays(signal: Signal, df: pd.DataFrame) -> list[OptionsPlay
         if p.strategy_name not in seen:
             seen.add(p.strategy_name)
             unique.append(p)
+
+    # Enrich each play with price movement insights and hold duration
+    for p in unique:
+        p.price_drivers = _analyze_price_drivers(signal, pt_mid, p.strategy_name)
+        dte = p.legs[0].days_to_expiry if p.legs else 30
+        hold, reasoning, theta, optimal = _compute_hold_duration(
+            signal, p.strategy_name, dte, p.entry_price,
+        )
+        p.hold_duration = hold
+        p.hold_reasoning = reasoning
+        p.theta_decay_warning = theta
+        p.optimal_exit_scenario = optimal
+
     return unique[:3]
 
 
@@ -440,6 +460,137 @@ def _build_risks(signal: Signal, strategy_name: str) -> list[str]:
     risks.append("Estimated premiums are model-derived — actual market prices will differ")
     risks.append("Low liquidity in some strikes may result in wider bid-ask spreads")
     return risks
+
+
+def _analyze_price_drivers(signal: Signal, pt, strategy_name: str) -> list[tuple]:
+    """
+    Explain what is driving the stock's price movement up or down.
+    Returns list of (factor, direction_emoji, description) tuples.
+    """
+    drivers = []
+
+    # Trend structure
+    if signal.momentum > 2:
+        drivers.append(("Momentum", "🟢", f"5-day ROC at +{signal.momentum:.1f}% — buyers are aggressively accumulating, pushing price higher"))
+    elif signal.momentum < -2:
+        drivers.append(("Momentum", "🔴", f"5-day ROC at {signal.momentum:.1f}% — selling pressure dominating, driving price lower"))
+    else:
+        drivers.append(("Momentum", "🟡", f"5-day ROC at {signal.momentum:+.1f}% — price is consolidating without strong directional pressure"))
+
+    # RSI interpretation
+    if signal.rsi > 70:
+        drivers.append(("Overbought Pressure", "🔴", f"RSI at {signal.rsi:.0f} — extreme buying exhaustion. When RSI exceeds 70, historically there's a 60-70% chance of a pullback within 5 days"))
+    elif signal.rsi > 60:
+        drivers.append(("Bullish Momentum", "🟢", f"RSI at {signal.rsi:.0f} — healthy uptrend zone. Price has room to run before hitting overbought territory"))
+    elif signal.rsi < 30:
+        drivers.append(("Oversold Bounce", "🟢", f"RSI at {signal.rsi:.0f} — extreme selling exhaustion. Mean-reversion bounce probability is elevated"))
+    elif signal.rsi < 40:
+        drivers.append(("Bearish Pressure", "🔴", f"RSI at {signal.rsi:.0f} — persistent selling. Price is struggling to find buyers"))
+    else:
+        drivers.append(("Neutral RSI", "🟡", f"RSI at {signal.rsi:.0f} — balanced buying and selling pressure"))
+
+    # Volume conviction
+    if signal.volume_ratio > 2.0:
+        drivers.append(("Volume Conviction", "🟢", f"Relative volume at {signal.volume_ratio:.1f}x average — institutional participants are entering. High volume validates the current price trend"))
+    elif signal.volume_ratio > 1.3:
+        drivers.append(("Rising Interest", "🟢", f"Volume at {signal.volume_ratio:.1f}x average — above-normal participation confirms directional bias"))
+    elif signal.volume_ratio < 0.7:
+        drivers.append(("Low Conviction", "🔴", f"Volume at only {signal.volume_ratio:.1f}x average — current move lacks participation and may reverse"))
+
+    # MACD
+    if signal.macd_hist > 0:
+        drivers.append(("MACD Tailwind", "🟢", "MACD histogram positive — buying momentum is accelerating relative to its moving average"))
+    elif signal.macd_hist < 0:
+        drivers.append(("MACD Headwind", "🔴", "MACD histogram negative — selling momentum is strengthening"))
+
+    # Volatility regime
+    if signal.volatility > 3:
+        drivers.append(("High Volatility", "🟡", f"ATR-based volatility at {signal.volatility:.1f}% — large daily swings make timing critical. Wider stops needed"))
+    elif signal.volatility < 1:
+        drivers.append(("Low Volatility", "🟡", f"ATR-based volatility at {signal.volatility:.1f}% — tight range. Options premiums are cheap but movement may be limited"))
+
+    # Active signals
+    for sig_text in signal.signals[:2]:
+        if "squeeze" in sig_text.lower():
+            drivers.append(("Squeeze Setup", "🟢", "Bollinger-Keltner squeeze detected — volatility is compressed and a directional expansion is imminent. This is the #1 breakout setup"))
+        elif "above all major" in sig_text.lower():
+            drivers.append(("Trend Alignment", "🟢", "Price above all key moving averages — the trend is confirmed bullish across timeframes"))
+        elif "below all major" in sig_text.lower():
+            drivers.append(("Trend Breakdown", "🔴", "Price below all key moving averages — downtrend confirmed. Rallies are likely to be sold"))
+
+    return drivers
+
+
+def _compute_hold_duration(signal: Signal, strategy_name: str, dte: int, entry_premium: float) -> tuple[str, str, str, str]:
+    """
+    Compute recommended hold duration based on theta decay, strategy type,
+    and market conditions.
+
+    Returns (hold_duration, hold_reasoning, theta_warning, optimal_exit)
+    """
+    # Theta acceleration curve: options lose value exponentially in the last 2 weeks
+    theta_safe_days = max(5, dte - 14)  # stop holding 14 days before expiry
+
+    if "Spread" in strategy_name or "Iron" in strategy_name:
+        # Spreads: can hold longer because short leg offsets theta
+        if signal.confidence >= 70:
+            hold = f"7-{min(21, theta_safe_days)} days"
+            reasoning = (
+                f"Credit/debit spreads have reduced theta exposure because the short leg decays alongside the long leg. "
+                f"With {signal.confidence}% model confidence, you have a statistical edge that benefits from time. "
+                f"Hold until 50-70% of max profit is reached, or exit {min(7, theta_safe_days)} days before expiry."
+            )
+        else:
+            hold = f"5-{min(14, theta_safe_days)} days"
+            reasoning = (
+                f"At {signal.confidence}% confidence, the edge is moderate. Take profits quickly — aim for 40-50% of max profit. "
+                f"Time works for you in credit spreads but against you in debit spreads."
+            )
+        theta_warn = f"Theta impact is partially hedged by the short leg. Net theta decay is ${abs(entry_premium * 0.02):.2f}/day estimated."
+        optimal = f"Ideal exit: stock moves decisively to ${signal.price * (1.03 if 'bullish' in signal.direction else 0.97):.2f}, capturing 60%+ of max profit within the first week."
+
+    elif "Straddle" in strategy_name:
+        hold = "1-5 days"
+        reasoning = (
+            f"Straddles are pure volatility plays — you need a big move fast before theta eats the premium. "
+            f"With ATR at {signal.volatility:.1f}%, you need a {signal.volatility * 2:.1f}%+ move to profit. "
+            f"If no move occurs within 3-5 days, cut losses at 30-40% of premium paid."
+        )
+        theta_warn = f"CRITICAL: Both legs decay simultaneously. You lose ~${abs(entry_premium * 0.06):.2f}/day in time value. Every flat day costs you."
+        optimal = "Ideal exit: a gap move or news catalyst within 1-3 days. Take 50%+ of premium as profit and close immediately."
+
+    else:
+        # Naked long options (calls/puts)
+        if signal.confidence >= 75 and abs(signal.momentum) > 2:
+            hold = f"5-{min(15, theta_safe_days)} days"
+            reasoning = (
+                f"Strong momentum ({signal.momentum:+.1f}%) and high model confidence ({signal.confidence}%) justify a multi-day hold. "
+                f"However, naked options bleed theta daily. Set a 100% profit target and a 50% stop loss on the premium."
+            )
+        elif signal.confidence >= 60:
+            hold = f"3-{min(10, theta_safe_days)} days"
+            reasoning = (
+                f"Moderate conviction at {signal.confidence}% — don't overstay. Professional traders take partial profits at 50% and move stops to breakeven. "
+                f"If the stock doesn't move in your direction within 3 days, the thesis may be wrong."
+            )
+        else:
+            hold = "1-3 days (day-trade preferred)"
+            reasoning = (
+                f"At {signal.confidence}% confidence, this is a low-edge speculative play. "
+                f"Treat it as a day trade or very short swing. Cut losses fast — no more than 30% of premium."
+            )
+
+        theta_warn = (
+            f"Naked options lose time value every day. With {dte} DTE, theta is "
+            f"{'accelerating rapidly — you are in the danger zone' if dte < 14 else 'moderate but increasing daily'}. "
+            f"Estimated daily decay: ~${abs(entry_premium * 0.04):.2f}/contract."
+        )
+        optimal = (
+            f"Ideal exit: stock reaches ${signal.price * (1.05 if 'bullish' in signal.direction else 0.95):.2f} within the first "
+            f"{'3 days' if signal.confidence >= 70 else '1-2 days'}, doubling the option premium. Close immediately and don't look back."
+        )
+
+    return hold, reasoning, theta_warn, optimal
 
 
 def _make_leg(S, K, T_years, r, sigma, direction, option_type):

@@ -194,20 +194,29 @@ def grade_color(g):
 def sentiment_color(s):
     return {"bullish":"#34C759","bearish":"#FF453A"}.get(s,"rgba(255,255,255,0.3)")
 
-def to_1d(df, col):
+def to_list(df, col):
     """
-    Return a strictly 1-D numpy array for a DataFrame column.
-    Handles cases where yfinance returns MultiIndex columns that get
-    flattened into duplicated column names, producing 2-D data.
-    Required for plotly.graph_objects.Candlestick on Python 3.14+.
+    Return a plain Python list of floats for a DataFrame column.
+    Plotly 6.x on Python 3.14 rejects numpy arrays and pandas Series
+    for Candlestick OHLC fields in some configurations. Plain Python
+    lists always pass validation.
     """
     s = df[col]
     if isinstance(s, pd.DataFrame):
         s = s.iloc[:, 0]
-    arr = np.asarray(s).astype(float)
-    if arr.ndim > 1:
-        arr = arr.ravel()
-    return arr
+    return [float(v) for v in s.values.ravel()]
+
+
+def idx_to_str(index):
+    """
+    Convert a DatetimeIndex to a list of ISO strings.
+    Plotly 6.x on Python 3.14 can choke on timezone-aware pandas
+    DatetimeIndex objects passed directly to x= parameters.
+    """
+    try:
+        return [t.isoformat() for t in index]
+    except Exception:
+        return list(index)
 
 # ─── Header ──────────────────────────────────────────────────────
 h1, h2 = st.columns([3, 1])
@@ -575,11 +584,11 @@ with tab_intraday:
 
                         fig = go.Figure()
                         fig.add_trace(go.Candlestick(
-                            x=today.index,
-                            open=to_1d(today, "Open"),
-                            high=to_1d(today, "High"),
-                            low=to_1d(today, "Low"),
-                            close=to_1d(today, "Close"),
+                            x=idx_to_str(today.index),
+                            open=to_list(today, "Open"),
+                            high=to_list(today, "High"),
+                            low=to_list(today, "Low"),
+                            close=to_list(today, "Close"),
                             increasing_line_color="#34C759",
                             decreasing_line_color="#FF453A",
                             increasing_fillcolor="#34C75930",
@@ -587,7 +596,7 @@ with tab_intraday:
                             name="Price",
                         ))
                         fig.add_trace(go.Scatter(
-                            x=today.index, y=to_1d(today, "vwap"),
+                            x=idx_to_str(today.index), y=to_list(today, "vwap"),
                             mode="lines", line=dict(color="#0A84FF", width=1.5, dash="dot"),
                             name="VWAP", hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
                         ))
@@ -634,21 +643,22 @@ with tab_detail:
         with ch_col:
             df = data_dict.get(sel)
             if df is not None:
+                x_vals = idx_to_str(df.index)
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
                 fig.add_trace(go.Candlestick(
-                    x=df.index,
-                    open=to_1d(df, "Open"),
-                    high=to_1d(df, "High"),
-                    low=to_1d(df, "Low"),
-                    close=to_1d(df, "Close"),
+                    x=x_vals,
+                    open=to_list(df, "Open"),
+                    high=to_list(df, "High"),
+                    low=to_list(df, "Low"),
+                    close=to_list(df, "Close"),
                     increasing_line_color="#34C759", decreasing_line_color="#FF453A",
                     increasing_fillcolor="#34C75930", decreasing_fillcolor="#FF453A30",
                 ), row=1, col=1)
-                close_arr = to_1d(df, "Close")
-                open_arr = to_1d(df, "Open")
-                vol_arr = to_1d(df, "Volume")
+                close_arr = to_list(df, "Close")
+                open_arr = to_list(df, "Open")
+                vol_arr = to_list(df, "Volume")
                 vc = ["#34C759" if c >= o else "#FF453A" for c, o in zip(close_arr, open_arr)]
-                fig.add_trace(go.Bar(x=df.index, y=vol_arr, marker_color=vc, opacity=0.4), row=2, col=1)
+                fig.add_trace(go.Bar(x=x_vals, y=vol_arr, marker_color=vc, opacity=0.4), row=2, col=1)
                 fig.update_layout(**PLOTLY_LAYOUT, height=420, showlegend=False, xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"detail_{sel}")
 
@@ -742,9 +752,51 @@ with tab_options:
                 st.markdown(gh + '</div>', unsafe_allow_html=True)
 
                 st.markdown(f'<p class="section-label">Timing</p><div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;"><div class="kv-cell"><div class="kv-label">Entry</div><div style="font-size:13px; color:rgba(255,255,255,0.6); margin-top:4px;">{play.entry_timing}</div></div><div class="kv-cell"><div class="kv-label">Exit</div><div style="font-size:13px; color:rgba(255,255,255,0.6); margin-top:4px;">{play.exit_timing}</div></div></div>', unsafe_allow_html=True)
+
+                # ── Hold Duration & Theta ──────────────────────
+                if play.hold_duration:
+                    st.markdown('<p class="section-label">How Long to Hold</p>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div style="display:grid; grid-template-columns:1fr 2fr; gap:12px;">'
+                        f'<div class="kv-cell" style="display:flex; flex-direction:column; justify-content:center; align-items:center;">'
+                        f'<div class="kv-label">Recommended Hold</div>'
+                        f'<div class="mono" style="font-size:22px; font-weight:700; color:{t_clr}; margin-top:6px;">{play.hold_duration}</div>'
+                        f'</div>'
+                        f'<div class="kv-cell">'
+                        f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.hold_reasoning}</div>'
+                        f'</div></div>', unsafe_allow_html=True)
+
+                    # Theta warning
+                    if play.theta_decay_warning:
+                        st.markdown(
+                            f'<div style="background:rgba(255,159,10,0.08); border:1px solid rgba(255,159,10,0.2); border-radius:10px; padding:14px 18px; margin-top:10px;">'
+                            f'<div style="font-family:\'JetBrains Mono\'; font-size:10px; font-weight:600; color:#FF9F0A; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">⏳ Theta Decay Impact</div>'
+                            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.theta_decay_warning}</div>'
+                            f'</div>', unsafe_allow_html=True)
+
+                    # Optimal exit
+                    if play.optimal_exit_scenario:
+                        st.markdown(
+                            f'<div style="background:rgba(52,199,89,0.06); border:1px solid rgba(52,199,89,0.15); border-radius:10px; padding:14px 18px; margin-top:10px;">'
+                            f'<div style="font-family:\'JetBrains Mono\'; font-size:10px; font-weight:600; color:#34C759; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">🎯 Optimal Exit Scenario</div>'
+                            f'<div style="font-family:\'DM Sans\'; font-size:13px; color:rgba(255,255,255,0.6); line-height:1.6;">{play.optimal_exit_scenario}</div>'
+                            f'</div>', unsafe_allow_html=True)
+
+                # ── Price Movement Insights ────────────────────
+                if play.price_drivers:
+                    st.markdown('<p class="section-label">What\'s Driving the Price</p>', unsafe_allow_html=True)
+                    for factor, emoji, desc in play.price_drivers:
+                        st.markdown(
+                            f'<div class="driver-row">'
+                            f'<span style="font-size:16px; flex-shrink:0;">{emoji}</span>'
+                            f'<div>'
+                            f'<div style="font-family:\'DM Sans\'; font-size:13px; font-weight:600; color:#F5F5F7;">{factor}</div>'
+                            f'<div style="font-family:\'DM Sans\'; font-size:12px; color:rgba(255,255,255,0.5); margin-top:2px; line-height:1.5;">{desc}</div>'
+                            f'</div></div>', unsafe_allow_html=True)
+
                 st.markdown(f'<p class="section-label">Thesis</p><div class="thesis-block">{play.thesis}</div>', unsafe_allow_html=True)
 
-                st.markdown('<p class="section-label">Drivers</p>', unsafe_allow_html=True)
+                st.markdown('<p class="section-label">Technical Drivers</p>', unsafe_allow_html=True)
                 dic = {"primary":("#0A84FF","rgba(10,132,255,0.12)"),"strong":("#34C759","rgba(52,199,89,0.12)"),"supportive":("#30D158","rgba(48,209,88,0.10)"),"moderate":("#FFD60A","rgba(255,214,10,0.12)"),"caution":("#FF9F0A","rgba(255,159,10,0.12)"),"neutral":("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"),"context":("#BF5AF2","rgba(191,90,242,0.12)"),"signal":("#5AC8FA","rgba(90,200,250,0.12)")}
                 for f, d, i in play.drivers:
                     ic, ib = dic.get(i, ("rgba(255,255,255,0.4)","rgba(255,255,255,0.06)"))
