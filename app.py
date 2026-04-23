@@ -591,8 +591,8 @@ with tab_intraday:
                             close=to_list(today, "Close"),
                             increasing_line_color="#34C759",
                             decreasing_line_color="#FF453A",
-                            increasing_fillcolor="#34C75930",
-                            decreasing_fillcolor="#FF453A30",
+                            increasing_fillcolor="rgba(52,199,89,0.19)",
+                            decreasing_fillcolor="rgba(255,69,58,0.19)",
                             name="Price",
                         ))
                         fig.add_trace(go.Scatter(
@@ -652,7 +652,7 @@ with tab_detail:
                     low=to_list(df, "Low"),
                     close=to_list(df, "Close"),
                     increasing_line_color="#34C759", decreasing_line_color="#FF453A",
-                    increasing_fillcolor="#34C75930", decreasing_fillcolor="#FF453A30",
+                    increasing_fillcolor="rgba(52,199,89,0.19)", decreasing_fillcolor="rgba(255,69,58,0.19)",
                 ), row=1, col=1)
                 close_arr = to_list(df, "Close")
                 open_arr = to_list(df, "Open")
