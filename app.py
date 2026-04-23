@@ -600,7 +600,15 @@ with tab_intraday:
                             mode="lines", line=dict(color="#0A84FF", width=1.5, dash="dot"),
                             name="VWAP", hovertemplate="VWAP: $%{y:.2f}<extra></extra>",
                         ))
-                        fig.update_layout(**PLOTLY_LAYOUT, height=220, xaxis_rangeslider_visible=False, showlegend=False, margin=dict(l=0,r=0,t=10,b=0))
+                        fig.update_layout(
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                            font=dict(family="DM Sans, sans-serif", color="rgba(255,255,255,0.5)", size=11),
+                            xaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
+                            yaxis=dict(gridcolor="rgba(255,255,255,0.04)", showgrid=True),
+                            hoverlabel=dict(bgcolor="#1c1c1e", font_size=12, font_family="JetBrains Mono"),
+                            height=220, xaxis_rangeslider_visible=False, showlegend=False,
+                            margin=dict(l=0, r=0, t=10, b=0),
+                        )
                         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"intraday_{t}")
 
 # ═══ TAB 4: DETAIL VIEW ═══
@@ -824,7 +832,7 @@ with tab_heatmap:
         scores = [get_score(t) for t in ts]
         sc = [grade_color(get_grade(t)) for t in ts]
         fig = go.Figure(go.Bar(x=ts, y=scores, marker_color=sc, text=[f"{s:.0f}" for s in scores], textposition="outside", textfont=dict(family="JetBrains Mono", size=11, color="rgba(255,255,255,0.5)")))
-        fig.update_layout(**PLOTLY_LAYOUT, height=350, yaxis=dict(range=[0, max_y * 1.05], gridcolor="rgba(255,255,255,0.04)"))
+        fig.update_layout(**{**PLOTLY_LAYOUT, "yaxis": dict(range=[0, max_y * 1.05], gridcolor="rgba(255,255,255,0.04)")}, height=350)
         st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key="heatmap_main")
 
         st.markdown('<p class="section-label">Full Dashboard</p>', unsafe_allow_html=True)
