@@ -24,6 +24,14 @@ LARGE_CAP_TICKERS = [
     "TSLA", "JPM", "V", "UNH", "LLY", "AVGO",
 ]
 
+# Liquid ETFs — index / sector proxies (options flow context, hedging, relative value)
+ETF_TICKERS = [
+    "SPY", "QQQ", "IWM", "DIA", "VOO", "XLK", "XLE", "SMH", "GLD", "TLT",
+]
+
+# Combined liquid equity + ETF universe (deduped order preserved)
+LIQUID_UNIVERSE = list(dict.fromkeys(LARGE_CAP_TICKERS + ETF_TICKERS))
+
 # Penny tickers: dynamically discovered each session by the screener.
 # This static list is only a FALLBACK if the screener can't run.
 PENNY_TICKERS_FALLBACK = [
@@ -35,7 +43,7 @@ PENNY_TICKERS_FALLBACK = [
 # Will be populated dynamically in app.py via the screener module
 PENNY_TICKERS = PENNY_TICKERS_FALLBACK
 
-DEFAULT_TICKERS = LARGE_CAP_TICKERS + PENNY_TICKERS_FALLBACK
+DEFAULT_TICKERS = LIQUID_UNIVERSE + PENNY_TICKERS_FALLBACK
 
 TICKER_META = {
     "AAPL": ("Apple Inc.", "Technology"), "NVDA": ("NVIDIA Corp.", "Semiconductors"),
@@ -57,6 +65,11 @@ TICKER_META = {
     "APRE": ("Aprea Therapeutics", "Biotech"), "BIVI": ("BioVie Inc.", "Biotech"),
     "CLOV": ("Clover Health", "Healthcare"), "SNDL": ("SNDL Inc.", "Cannabis"),
     "TLRY": ("Tilray Brands", "Cannabis"),
+    "SPY": ("SPDR S&P 500 ETF", "ETF"), "QQQ": ("Invesco QQQ Trust", "ETF"),
+    "IWM": ("iShares Russell 2000 ETF", "ETF"), "DIA": ("SPDR Dow ETF", "ETF"),
+    "VOO": ("Vanguard S&P 500 ETF", "ETF"), "XLK": ("Tech Select Sector SPDR", "ETF"),
+    "XLE": ("Energy Select Sector SPDR", "ETF"), "SMH": ("VanEck Semiconductor ETF", "ETF"),
+    "GLD": ("SPDR Gold Shares", "ETF"), "TLT": ("iShares 20+ Year Treasury", "ETF"),
 }
 
 

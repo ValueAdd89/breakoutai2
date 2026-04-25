@@ -25,7 +25,7 @@ except ImportError:
 
 from utils.data import (
     fetch_batch_data, get_ticker_info, classify_stock,
-    LARGE_CAP_TICKERS, PENNY_TICKERS_FALLBACK, REFRESH_INTERVALS, CACHE_TTL_MAP,
+    LIQUID_UNIVERSE, PENNY_TICKERS_FALLBACK, REFRESH_INTERVALS, CACHE_TTL_MAP,
 )
 from utils.screener import get_live_penny_tickers, get_scan_results, SEED_UNIVERSE
 from utils.catalysts import fetch_news, fetch_company_profile, _get_api_key
@@ -54,15 +54,15 @@ with st.sidebar:
     st.caption(f"Found {len(live_pennies)} stocks under ${max_penny_price:.0f} from {len(SEED_UNIVERSE)} scanned")
 
     st.markdown("---")
-    ticker_mode = st.radio("Watchlist", ["All (Large + Live Pennies)", "Large Cap Only", "Live Pennies Only", "Custom"])
-    if ticker_mode == "All (Large + Live Pennies)":
-        selected_tickers = list(set(LARGE_CAP_TICKERS + live_pennies))
-    elif ticker_mode == "Large Cap Only":
-        selected_tickers = LARGE_CAP_TICKERS
+    ticker_mode = st.radio("Watchlist", ["All (Liquid + Live Pennies)", "Liquid Only (Lg Cap + ETFs)", "Live Pennies Only", "Custom"])
+    if ticker_mode == "All (Liquid + Live Pennies)":
+        selected_tickers = list(set(LIQUID_UNIVERSE + live_pennies))
+    elif ticker_mode == "Liquid Only (Lg Cap + ETFs)":
+        selected_tickers = list(LIQUID_UNIVERSE)
     elif ticker_mode == "Live Pennies Only":
         selected_tickers = live_pennies if live_pennies else PENNY_TICKERS_FALLBACK
     else:
-        all_avail = list(set(LARGE_CAP_TICKERS + live_pennies + PENNY_TICKERS_FALLBACK))
+        all_avail = list(set(LIQUID_UNIVERSE + live_pennies + PENNY_TICKERS_FALLBACK))
         selected_tickers = st.multiselect("Custom", all_avail, all_avail[:12])
     st.markdown("---")
     lookback = st.selectbox("Lookback", ["3mo", "6mo", "1y", "2y"], index=1)
@@ -131,6 +131,12 @@ div[data-baseweb="select"]>div{background:var(--card)!important;border:1px solid
 .pc.volatility::before{background:linear-gradient(90deg,#BF5AF2,#FF6FF1);}
 .tb{background:rgba(255,255,255,0.02);border-left:3px solid rgba(255,255,255,0.1);padding:10px 14px;border-radius:0 7px 7px 0;font-family:'DM Sans';font-size:11px;color:rgba(255,255,255,0.6);line-height:1.5;}
 .lr{display:flex;align-items:center;gap:7px;padding:6px 9px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);border-radius:6px;margin-bottom:3px;font-family:'JetBrains Mono';font-size:10px;}
+.opt-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px 18px;margin-bottom:14px;}
+.opt-rhrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px;}
+.opt-cell{background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:10px 12px;}
+.opt-cell em{font-style:normal;font-family:'JetBrains Mono';font-size:15px;font-weight:700;color:#F5F5F7;display:block;margin-top:4px;}
+.hm-head{font-family:'DM Sans';font-size:13px;font-weight:700;color:#F5F5F7;}
+.hm-sub{font-family:'JetBrains Mono';font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px;}
 </style>""", unsafe_allow_html=True)
 
 # ═══ HELPERS ══════════════════════════════════════════════════════
@@ -156,6 +162,118 @@ PROFILE_CFG = {
     "Aggressive": {"reliability_shift": -6, "distance_penalty": 7.5, "near_node_pct": 4.0},
 }
 profile_cfg = PROFILE_CFG.get(trader_profile, PROFILE_CFG["Balanced"])
+
+
+def _heatmap_strike_window(kp, strike_rows):
+    center_idx = min(range(len(kp.levels)), key=lambda i: abs(kp.levels[i] - kp.current_price))
+    half_window = max(10, strike_rows // 2)
+    i0 = max(0, center_idx - half_window)
+    i1 = min(len(kp.levels), center_idx + half_window)
+    strike_slice = kp.levels[i0:i1]
+    strike_prices = sorted([round(float(x), 2) for x in strike_slice], reverse=True)
+    if len(strike_prices) > strike_rows:
+        step = max(1, len(strike_prices) // strike_rows)
+        strike_prices = strike_prices[::step][:strike_rows]
+    return strike_prices
+
+
+def _strike_flow_scalar(kp, sig, s_px, flow_mode, sigma, j_max=4):
+    direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
+    rel_side = 1.0 if s_px < kp.current_price else -1.0
+    acc = 0.0
+    for j in range(j_max):
+        node_influence = 0.0
+        for kn in kp.king_nodes:
+            dist = abs(s_px - kn.price_level)
+            falloff = np.exp(-((dist / sigma) ** 2))
+            node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
+            node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
+            node_influence += node_sign * node_weight * kn.volume_pct * falloff
+        tenor_decay = max(0.35, 1.0 - j * 0.18)
+        seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
+        raw = (node_influence * 1.8 + direction_sign * 22.0 + rel_side * 12.0 + seasonal) * tenor_decay
+        if flow_mode == "Call Pressure":
+            raw = max(raw, 0.0)
+        elif flow_mode == "Put Pressure":
+            raw = min(raw, 0.0)
+        acc += raw
+    return acc / j_max
+
+
+def build_vertical_flow_panel(kp, sig, ticker: str, strike_rows: int = 28, flow_mode: str = "Net Flow"):
+    """Dense strike ladder + horizontal intensity bars (SPY / QQQ board style)."""
+    strike_prices = _heatmap_strike_window(kp, strike_rows)
+    if not strike_prices:
+        return go.Figure()
+    sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
+    flows = [_strike_flow_scalar(kp, sig, s_px, flow_mode, sigma) for s_px in strike_prices]
+    abs_flows = [abs(f) for f in flows]
+    mx = max(abs_flows) if abs_flows else 1.0
+    mx = mx if mx > 1e-6 else 1.0
+
+    king_level = None
+    if kp.king_nodes:
+        king_node = max(kp.king_nodes, key=lambda n: n.volume)
+        king_level = round(float(king_node.price_level), 2)
+
+    atm_idx = min(range(len(strike_prices)), key=lambda i: abs(strike_prices[i] - kp.current_price))
+
+    colors, line_widths, line_colors = [], [], []
+    for i, (s_px, f) in enumerate(zip(strike_prices, flows)):
+        ni = abs(f) / mx
+        if king_level is not None and abs(s_px - king_level) < 1e-2:
+            colors.append("#4A2F78")
+        elif ni > 0.82:
+            colors.append("#FFD166")
+        elif ni > 0.55:
+            colors.append("#2EA7B8")
+        elif ni > 0.3:
+            colors.append("#256B75")
+        else:
+            colors.append("#2A1F45")
+        lw = 2 if i == atm_idx else 0
+        lc = "rgba(245,245,247,0.95)" if i == atm_idx else "rgba(0,0,0,0)"
+        line_widths.append(lw)
+        line_colors.append(lc)
+
+    y_labels = [f"{p:.1f}" if p >= 50 else f"{p:.2f}" for p in strike_prices]
+    display_text = []
+    for s_px, f in zip(strike_prices, flows):
+        star = " ★" if king_level and abs(s_px - king_level) < 1e-2 else ""
+        sign = "-" if f < 0 else ""
+        display_text.append(f"{sign}${abs(f):,.0f}K{star}")
+
+    fig = go.Figure(
+        data=[
+            go.Bar(
+                y=y_labels,
+                x=abs_flows,
+                orientation="h",
+                marker=dict(color=colors, line=dict(color=line_colors, width=line_widths)),
+                text=display_text,
+                textposition="outside",
+                textfont=dict(size=9, family="JetBrains Mono", color="rgba(245,245,247,0.92)"),
+                customdata=[f"{fv:+,.1f}K" for fv in flows],
+                hovertemplate="Strike %{y}<br>%{customdata}<extra></extra>",
+            )
+        ]
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(14,10,24,0.9)",
+        margin=dict(l=2, r=6, t=6, b=2),
+        height=min(540, 24 + len(strike_prices) * 17),
+        showlegend=False,
+        xaxis=dict(visible=False, range=[0, mx * 1.42], fixedrange=True),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.05)",
+            tickfont=dict(size=9, family="JetBrains Mono", color="rgba(255,255,255,0.55)"),
+            autorange="reversed",
+            fixedrange=True,
+        ),
+    )
+    return fig
 
 def runner_score(sig, cl, pf=None, nw=None):
     pts=0;facs=[]
@@ -471,393 +589,531 @@ with tab_det:
 
 # ═══ TAB 5: OPTIONS ══════════════════════════════════════════════
 with tab_opt:
-    ot=st.selectbox("Ticker",list(signals.keys()),format_func=lambda t:f"{t} — {signals[t].direction.title()}",key="o_s")
-    @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice,120),show_spinner=False)
-    def gp(tk,sh,lb):
-        s,d=signals.get(tk),data_dict.get(tk)
-        return generate_options_plays(s,d) if s and d is not None else []
-    sig=signals[ot];plays=gp(ot,f"{ot}_{sig.confidence}",lookback)
-    if not plays: st.warning(f"No plays for {ot}.")
+    st.markdown('<p class="sl">Options desk</p>', unsafe_allow_html=True)
+    st.caption("Robinhood-style limit band, take-profit / stop on premium, and stock context. Estimates only — not live quotes.")
+    ot = st.selectbox("Underlying", list(signals.keys()), format_func=lambda t: f"{t} — {signals[t].direction.title()}", key="o_s")
+
+    @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice, 120), show_spinner=False)
+    def gp(tk, sh, lb):
+        s, d = signals.get(tk), data_dict.get(tk)
+        return generate_options_plays(s, d) if s and d is not None else []
+
+    sig = signals[ot]
+    plays = gp(ot, f"{ot}_{sig.confidence}", lookback)
+    if not plays:
+        st.warning(f"No plays for {ot}. Try another ticker or enable ETFs / large caps in the watchlist.")
     else:
         for play in plays:
-            tc={"directional_bullish":("#34C759","rgba(52,199,89,0.12)"),"directional_bearish":("#FF453A","rgba(255,69,58,0.12)"),"neutral":("#0A84FF","rgba(10,132,255,0.12)"),"volatility":("#BF5AF2","rgba(191,90,242,0.12)")}
-            t_c,t_b=tc.get(play.strategy_type,("#FFD60A","rgba(255,214,10,0.12)"))
-            ccc="bullish" if "bullish" in play.strategy_type else "bearish" if "bearish" in play.strategy_type else "volatility" if play.strategy_type=="volatility" else "neutral"
-            st.markdown(f'<div class="pc {ccc}">',unsafe_allow_html=True)
-            pc1,pc2=st.columns([3,1])
-            with pc1: st.markdown(f'<div style="font-family:\'DM Sans\';font-size:18px;font-weight:700;color:#F5F5F7;">{play.strategy_name}</div><div style="display:flex;gap:4px;margin-top:2px;"><span class="b" style="background:{t_b};color:{t_c};font-family:\'JetBrains Mono\';font-size:8px;">{play.strategy_type.replace("_"," ")}</span><span class="b" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.5);font-family:\'JetBrains Mono\';font-size:8px;">{play.risk_tier}</span></div>',unsafe_allow_html=True)
-            with pc2: st.markdown(f'<div style="text-align:right;"><div class="kl">PoP</div><div class="mono" style="font-size:22px;font-weight:700;color:{t_c};">{play.probability_of_profit}%</div></div>',unsafe_allow_html=True)
-            for leg in play.legs:
-                dc="#34C759" if leg.direction=="buy" else "#FF6961"
-                db="rgba(52,199,89,0.15)" if leg.direction=="buy" else "rgba(255,105,97,0.15)"
-                st.markdown(f'<div class="lr"><span style="background:{db};color:{dc};font-weight:700;font-size:8px;padding:1px 4px;border-radius:3px;text-transform:uppercase;">{leg.direction}</span><span style="color:#F5F5F7;font-weight:600;">{leg.option_type.upper()}</span><span style="color:rgba(255,255,255,0.4);">K</span>${leg.strike:.0f}<span style="color:rgba(255,255,255,0.4);">Prem</span>${leg.estimated_premium:.2f}<span style="color:rgba(255,255,255,0.3);margin-left:auto;">Δ{leg.delta:.2f}</span></div>',unsafe_allow_html=True)
-            icr=play.strategy_type=="neutral" or "Short" in play.strategy_name
-            gi=[(("Credit" if icr else "Debit"),f"${play.entry_price:.2f}"),("MaxLoss",f"${play.max_loss:.0f}"),("MaxGain","∞" if play.max_gain==-1 else f"${play.max_gain:.0f}"),("R/R",f"{play.risk_reward_ratio:.1f}x"),("BE",f"${play.break_even:.2f}"),("PoP",f"{play.probability_of_profit}%")]
-            gh='<div class="kg">'
-            for l,v in gi: gh+=f'<div class="kc"><div class="kl">{l}</div><div class="kv">{v}</div></div>'
-            st.markdown(gh+'</div>',unsafe_allow_html=True)
-            st.markdown(
-                f'<div class="kc" style="margin-top:6px;"><div class="kl">Execution Checklist</div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.45;">'
-                f'1) Trigger: {play.entry_timing}<br>'
-                f'2) Target discipline: {play.exit_timing}<br>'
-                f'3) Risk: stop near {play.stop_loss:.2f} premium-equivalent, do not average losers.'
-                f'</div></div>',
-                unsafe_allow_html=True,
-            )
-            if play.hold_duration:
-                st.markdown(f'<div style="display:grid;grid-template-columns:auto 1fr;gap:8px;margin-top:8px;"><div class="kc" style="text-align:center;"><div class="kl">Hold</div><div class="mono" style="font-size:14px;font-weight:700;color:{t_c};">{play.hold_duration}</div></div><div class="kc"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.4;">{play.hold_reasoning}</div></div></div>',unsafe_allow_html=True)
-            if play.theta_decay_warning:
-                st.markdown(f'<div class="kc" style="margin-top:6px;border-left:2px solid #FF9F0A;"><div class="kl">Theta Risk</div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.theta_decay_warning}</div></div>',unsafe_allow_html=True)
-            if play.optimal_exit_scenario:
-                st.markdown(f'<div class="kc" style="margin-top:6px;border-left:2px solid #34C759;"><div class="kl">Optimal Exit</div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.optimal_exit_scenario}</div></div>',unsafe_allow_html=True)
-            if play.price_drivers:
-                for f,e,d in play.price_drivers[:3]:
-                    st.markdown(f'<div class="dr"><span style="font-size:12px;">{e}</span><div><div style="font-family:\'DM Sans\';font-size:10px;font-weight:600;color:#F5F5F7;">{f}</div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);">{d}</div></div></div>',unsafe_allow_html=True)
-            if play.risks:
-                st.markdown('<p class="sl" style="margin-top:8px;">Risk Flags</p>',unsafe_allow_html=True)
-                for rk in play.risks[:2]:
-                    st.markdown(f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,120,120,0.78);line-height:1.35;padding:2px 0;">• {rk}</div>',unsafe_allow_html=True)
-            st.markdown(f'<div class="tb" style="margin-top:6px;">{play.thesis}</div>',unsafe_allow_html=True)
-            st.markdown('</div>',unsafe_allow_html=True)
+            pt = play.price_target
+            tc = {
+                "directional_bullish": ("#34C759", "rgba(52,199,89,0.14)"),
+                "directional_bearish": ("#FF453A", "rgba(255,69,58,0.14)"),
+                "neutral": ("#0A84FF", "rgba(10,132,255,0.14)"),
+                "volatility": ("#BF5AF2", "rgba(191,90,242,0.14)"),
+            }
+            t_c, t_b = tc.get(play.strategy_type, ("#FFD60A", "rgba(255,214,10,0.14)"))
+            is_credit = play.strategy_type == "neutral" or "Short" in play.strategy_name
+            prem = float(play.entry_price) or 0.01
+            if is_credit:
+                lim_lo, lim_hi = round(prem * 0.92, 2), round(prem * 1.08, 2)
+                limit_hint = f"Collect ≥ ${lim_lo:.2f} · ideal ${prem:.2f} · max give ${lim_hi:.2f} credit"
+            else:
+                lim_lo, lim_hi = round(prem * 0.97, 2), round(prem * 1.05, 2)
+                limit_hint = f"Pay ≤ ${lim_hi:.2f} · target ${prem:.2f} · stretch ${lim_lo:.2f} debit"
+            tp_pct = ((play.profit_target / prem) - 1.0) * 100.0 if prem else 0.0
+            sl_pct = ((play.stop_loss / prem) - 1.0) * 100.0 if prem else 0.0
+            chg_c = "#34C759" if sig.change_1d >= 0 else "#FF453A"
+            et = play.exit_timing or ""
+            et_short = (et[:72] + "…") if len(et) > 72 else et
+
+            with st.container(border=True):
+                oh1, oh2 = st.columns([2, 1])
+                with oh1:
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
+                        f'<span style="font-family:\'DM Sans\';font-size:20px;font-weight:700;color:#F5F5F7;">{play.strategy_name}</span>'
+                        f'<span class="b" style="background:{t_b};color:{t_c};font-family:\'JetBrains Mono\';font-size:9px;">{play.strategy_type.replace("_", " ")}</span>'
+                        f'<span class="b" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.5);font-family:\'JetBrains Mono\';font-size:9px;">{play.risk_tier}</span>'
+                        f'</div>'
+                        f'<div class="hm-sub" style="margin-top:6px;">{ot} spot <span style="color:#F5F5F7;font-weight:600;">${sig.price:,.2f}</span> '
+                        f'<span style="color:{chg_c};">{sig.change_1d:+.2f}%</span> · {play.entry_timing}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with oh2:
+                    st.markdown(
+                        f'<div style="text-align:right;"><div class="kl">Est. PoP</div>'
+                        f'<div class="mono" style="font-size:26px;font-weight:700;color:{t_c};">{play.probability_of_profit:.0f}%</div></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(
+                    f'<div class="opt-rhrow">'
+                    f'<div class="opt-cell"><span class="kl">Limit entry (premium)</span><em>${lim_lo:.2f} – ${lim_hi:.2f}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">{limit_hint}</div></div>'
+                    f'<div class="opt-cell"><span class="kl">Take profit (exit)</span><em>${play.profit_target:.2f}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(52,199,89,0.75);margin-top:6px;">≈ {tp_pct:+.0f}% vs entry debit/credit base</div></div>'
+                    f'<div class="opt-cell"><span class="kl">Stop loss</span><em>${play.stop_loss:.2f}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,69,58,0.75);margin-top:6px;">≈ {sl_pct:+.0f}% vs entry</div></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown(
+                    f'<div class="opt-rhrow" style="margin-top:10px;">'
+                    f'<div class="opt-cell"><span class="kl">Breakeven (stock)</span><em>${play.break_even:.2f}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">At expiry, strategy turns green above/below this handle.</div></div>'
+                    f'<div class="opt-cell"><span class="kl">90% CI stock range</span><em>${pt.target_low:,.0f} – ${pt.target_high:,.0f}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">{pt.horizon_days}d · ann. vol {pt.annual_vol:.0f}%</div></div>'
+                    f'<div class="opt-cell"><span class="kl">Exit timing</span><em style="font-size:12px;">{et_short}</em>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">Full detail in hold window below.</div></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                icr = is_credit
+                gi = [
+                    (("Credit" if icr else "Debit"), f"${play.entry_price:.2f}"),
+                    ("Max loss", f"${play.max_loss:.0f}"),
+                    ("Max gain", "∞" if play.max_gain == -1 else f"${play.max_gain:.0f}"),
+                    ("R/R", f"{play.risk_reward_ratio:.1f}x"),
+                    ("Break-even", f"${play.break_even:.2f}"),
+                    ("PoP", f"{play.probability_of_profit:.0f}%"),
+                ]
+                gh = '<div class="kg" style="margin-top:12px;">'
+                for lab, val in gi:
+                    gh += f'<div class="kc"><div class="kl">{lab}</div><div class="kv">{val}</div></div>'
+                st.markdown(gh + "</div>", unsafe_allow_html=True)
+
+                lg_cols = st.columns(len(play.legs))
+                for i, leg in enumerate(play.legs):
+                    dc = "#34C759" if leg.direction == "buy" else "#FF6961"
+                    db = "rgba(52,199,89,0.15)" if leg.direction == "buy" else "rgba(255,105,97,0.15)"
+                    with lg_cols[i]:
+                        st.markdown(
+                            f'<div class="kc" style="min-height:88px;">'
+                            f'<div class="kl">Leg {i + 1}</div>'
+                            f'<div style="margin-top:6px;"><span style="background:{db};color:{dc};font-weight:700;font-size:8px;padding:2px 6px;border-radius:4px;">{leg.direction}</span>'
+                            f' <span class="mono" style="font-size:13px;color:#F5F5F7;">{leg.option_type.upper()} ${leg.strike:.0f}</span></div>'
+                            f'<div class="hm-sub" style="margin-top:8px;">Est. ${leg.estimated_premium:.2f} · Δ {leg.delta:.2f} · {leg.days_to_expiry} DTE</div>'
+                            f'</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                st.markdown(
+                    f'<div class="kc" style="margin-top:12px;"><div class="kl">Execution checklist</div>'
+                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.5;">'
+                    f'1) Place a <strong>limit order</strong> inside the entry band.<br>'
+                    f'2) Set GTC exits: take-profit near <strong>${play.profit_target:.2f}</strong>, stop near <strong>${play.stop_loss:.2f}</strong> on the position premium.<br>'
+                    f'3) Stock risk anchor: <strong>${play.break_even:.2f}</strong> vs spot ${sig.price:.2f}.'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
+
+                if play.hold_duration:
+                    st.markdown(
+                        f'<div style="display:grid;grid-template-columns:auto 1fr;gap:10px;margin-top:10px;">'
+                        f'<div class="kc" style="text-align:center;"><div class="kl">Hold window</div>'
+                        f'<div class="mono" style="font-size:15px;font-weight:700;color:{t_c};">{play.hold_duration}</div></div>'
+                        f'<div class="kc"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.45;">{play.hold_reasoning}</div></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                if play.theta_decay_warning:
+                    st.markdown(
+                        f'<div class="kc" style="margin-top:8px;border-left:2px solid #FF9F0A;"><div class="kl">Theta risk</div>'
+                        f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.theta_decay_warning}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                if play.optimal_exit_scenario:
+                    st.markdown(
+                        f'<div class="kc" style="margin-top:8px;border-left:2px solid #34C759;"><div class="kl">Optimal exit</div>'
+                        f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.optimal_exit_scenario}</div></div>',
+                        unsafe_allow_html=True,
+                    )
+                if play.price_drivers:
+                    st.markdown('<p class="sl" style="margin-top:10px;">Drivers</p>', unsafe_allow_html=True)
+                    for f, e, d in play.price_drivers[:3]:
+                        st.markdown(
+                            f'<div class="dr"><span style="font-size:12px;">{e}</span><div><div style="font-family:\'DM Sans\';font-size:10px;font-weight:600;color:#F5F5F7;">{f}</div>'
+                            f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);">{d}</div></div></div>',
+                            unsafe_allow_html=True,
+                        )
+                if play.risks:
+                    st.markdown('<p class="sl" style="margin-top:8px;">Risk flags</p>', unsafe_allow_html=True)
+                    for rk in play.risks[:3]:
+                        st.markdown(
+                            f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,140,140,0.85);line-height:1.35;padding:2px 0;">• {rk}</div>',
+                            unsafe_allow_html=True,
+                        )
+                st.markdown(f'<div class="tb" style="margin-top:10px;">{play.thesis}</div>', unsafe_allow_html=True)
 
 # ═══ TAB 6: KING NODES HEATMAP ═══════════════════════════════════
 with tab_heat:
     st.markdown('<p class="sl">👑 King Nodes — Volume-at-Price Heatmap</p>',unsafe_allow_html=True)
     st.markdown('<div style="font-family:\'DM Sans\';font-size:11px;color:rgba(255,255,255,0.35);margin-bottom:14px;line-height:1.5;">King nodes are price levels where abnormally high volume was traded — institutional footprints. When price is <strong style="color:#34C759;">above</strong> a king node it acts as <strong style="color:#34C759;">support</strong>; <strong style="color:#FF453A;">below</strong> it acts as <strong style="color:#FF453A;">resistance</strong>. The <span style="color:#0A84FF;">POC</span> (Point of Control) is the single highest-volume level — where the market found fair value.</div>',unsafe_allow_html=True)
 
-    kn_sel=st.selectbox("Ticker",list(king_profiles.keys()),format_func=lambda t:f"{t} — {get_ticker_info(t)[0]}",key="kn_s")
-    kp=king_profiles.get(kn_sel)
-    if kp:
-        sig=signals[kn_sel]
-        node_by_price = {round(n.price_level, 2): n for n in kp.king_nodes}
-        above_nodes = sorted([n for n in kp.king_nodes if n.price_level > kp.current_price], key=lambda n: n.price_level)
-        below_nodes = sorted([n for n in kp.king_nodes if n.price_level < kp.current_price], key=lambda n: n.price_level, reverse=True)
-        top_king = next((n for n in kp.king_nodes if n.strength == "king"), kp.king_nodes[0] if kp.king_nodes else None)
-        nearest_above = min(above_nodes, key=lambda n: n.price_level - kp.current_price) if above_nodes else None
-        nearest_below = min(below_nodes, key=lambda n: kp.current_price - n.price_level) if below_nodes else None
+    if not king_profiles:
+        st.warning("No volume profile data. Expand the watchlist (include SPY / QQQ) or refresh.")
+    else:
+        keys_avail = sorted(king_profiles.keys())
+        defaults_board = [t for t in ("SPY", "QQQ", "IWM") if t in keys_avail]
+        for t in keys_avail:
+            if len(defaults_board) >= 3:
+                break
+            if t not in defaults_board:
+                defaults_board.append(t)
 
-        st.markdown('<p class="sl">Flow Heatmap (Options-Style Layout)</p>', unsafe_allow_html=True)
-        ht1, ht2, ht3, ht4 = st.columns([1.1, 1.1, 1.2, 1.6])
-        with ht1:
-            strike_rows = st.selectbox("Rows", [24, 32, 40], index=1, key="hm_rows")
-        with ht2:
-            horizon = st.selectbox("Horizon", ["1w", "1m", "2m"], index=1, key="hm_horizon")
-        with ht3:
+        st.markdown('<p class="sl">Flow board (multi-symbol ladder)</p>', unsafe_allow_html=True)
+        hb1, hb2, hb3, hb4 = st.columns([1, 1, 1.1, 1.3])
+        with hb1:
+            strike_rows = st.selectbox("Strikes shown", [24, 32, 40], index=1, key="hm_rows")
+        with hb2:
             flow_mode = st.selectbox("Metric", ["Net Flow", "Call Pressure", "Put Pressure"], index=0, key="hm_metric")
-        with ht4:
+        with hb3:
+            horizon = st.selectbox("Matrix horizon", ["1w", "1m", "2m"], index=1, key="hm_horizon")
+        with hb4:
             st.markdown(
-                f'<div class="kc" style="height:70px;"><div class="kl">Board</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="b" style="background:rgba(52,199,89,0.2);color:#34C759;">LIVE</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.55);">{datetime.now().strftime("%H:%M:%S")}</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.32);margin-top:5px;">{kn_sel} spot ${kp.current_price:.2f} · POC ${kp.poc:.2f}</div></div>',
+                f'<div class="kc"><div class="kl">Desk</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="b" style="background:rgba(52,199,89,0.2);color:#34C759;">LIVE</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.5);">{datetime.now().strftime("%H:%M:%S")}</span></div></div>',
                 unsafe_allow_html=True,
             )
 
-        # Construct an options-style strike x expiry heatmap from node structure.
-        center_idx = min(range(len(kp.levels)), key=lambda i: abs(kp.levels[i] - kp.current_price))
-        half_window = max(10, strike_rows // 2)
-        i0 = max(0, center_idx - half_window)
-        i1 = min(len(kp.levels), center_idx + half_window)
-        strike_slice = kp.levels[i0:i1]
-        strike_prices = sorted([round(x, 2) for x in strike_slice], reverse=True)
-        if len(strike_prices) > strike_rows:
-            step = max(1, len(strike_prices) // strike_rows)
-            strike_prices = strike_prices[::step][:strike_rows]
-
-        if horizon == "1w":
-            expiry_steps = [0, 3, 7, 10]
-        elif horizon == "2m":
-            expiry_steps = [0, 14, 30, 45]
-        else:
-            expiry_steps = [0, 7, 14, 28]
-        expiry_labels = [(pd.Timestamp.today() + pd.Timedelta(days=d)).strftime("%Y-%m-%d") for d in expiry_steps]
-
-        z_vals = []
-        text_vals = []
-        sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
-        direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
-        for s_px in strike_prices:
-            row = []
-            row_text = []
-            rel_side = 1.0 if s_px < kp.current_price else -1.0
-            for j, d in enumerate(expiry_steps):
-                node_influence = 0.0
-                for kn in kp.king_nodes:
-                    dist = abs(s_px - kn.price_level)
-                    falloff = np.exp(-(dist / sigma) ** 2)
-                    node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
-                    node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
-                    node_influence += node_sign * node_weight * kn.volume_pct * falloff
-                tenor_decay = max(0.35, 1.0 - j * 0.18)
-                directional = direction_sign * 22.0 + rel_side * 12.0
-                seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
-                raw = (node_influence * 1.8 + directional + seasonal) * tenor_decay
-                if flow_mode == "Call Pressure":
-                    raw = max(raw, 0.0)
-                elif flow_mode == "Put Pressure":
-                    raw = min(raw, 0.0)
-                row.append(raw)
-                row_text.append(f"${raw:,.1f}K")
-            z_vals.append(row)
-            text_vals.append(row_text)
-
-        heat = go.Figure(
-            data=[
-                go.Heatmap(
-                    z=z_vals,
-                    x=expiry_labels,
-                    y=strike_prices,
-                    text=text_vals,
-                    texttemplate="%{text}",
-                    textfont={"size": 10, "color": "rgba(245,245,247,0.92)", "family": "JetBrains Mono"},
-                    colorscale=[
-                        [0.0, "#7A1D2A"],
-                        [0.25, "#4C286B"],
-                        [0.5, "#332455"],
-                        [0.7, "#2E5B88"],
-                        [0.85, "#2EA7B8"],
-                        [1.0, "#FFD166"],
-                    ],
-                    zmid=0,
-                    showscale=False,
-                    hovertemplate="Strike %{y}<br>Expiry %{x}<br>Flow %{z:,.1f}K<extra></extra>",
-                )
-            ]
+        board_pick = st.multiselect(
+            "Board symbols (max 3)",
+            keys_avail,
+            default=defaults_board[: min(3, len(defaults_board))],
+            max_selections=3,
+            key="hm_board",
         )
-        heat.add_hline(
-            y=kp.current_price,
-            line_color="rgba(245,245,247,0.6)",
-            line_width=1.5,
-            line_dash="dot",
-        )
-        heat.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=0, r=0, t=8, b=0),
-            height=560,
-            font=dict(family="DM Sans", size=10, color="rgba(255,255,255,0.65)"),
-            xaxis=dict(side="top", showgrid=False, zeroline=False, title="Expiry"),
-            yaxis=dict(showgrid=False, zeroline=False, title="Strike", tickformat=".1f"),
-        )
-        st.plotly_chart(heat, use_container_width=True, config={"displayModeBar": False}, key=f"flow_heat_{kn_sel}")
-
-        chart_cols = st.columns(2)
-        with chart_cols[0]:
-            # Volume profile chart (horizontal bar chart of volume at each price level)
-            fig = go.Figure()
-            bar_colors = []
-            for lvl, vol in zip(kp.levels, kp.volumes):
-                kn = node_by_price.get(round(lvl, 2))
-                if kn and kn.strength == "king":
-                    bar_colors.append("#0A84FF")
-                elif kn and kn.strength == "major":
-                    bar_colors.append("#BF5AF2")
-                elif lvl < kp.current_price:
-                    bar_colors.append("rgba(52,199,89,0.4)")
+        bcols = st.columns(3)
+        for idx in range(3):
+            tkb = board_pick[idx] if idx < len(board_pick) else None
+            with bcols[idx]:
+                if tkb and tkb in king_profiles:
+                    kpb = king_profiles[tkb]
+                    sgb = signals[tkb]
+                    chgb = sgb.change_1d
+                    cc_b = "#34C759" if chgb >= 0 else "#FF453A"
+                    kn_max = max(kpb.king_nodes, key=lambda n: n.volume) if kpb.king_nodes else None
+                    kd_b = ((kn_max.price_level - kpb.current_price) / kpb.current_price * 100.0) if kn_max else 0.0
+                    kd_s = f"{kd_b:+.1f}% vs spot" if kn_max else "—"
+                    st.markdown(
+                        f'<div class="kc" style="margin-bottom:8px;padding:10px 12px;"><div class="hm-head">{tkb}</div>'
+                        f'<div class="hm-sub" style="color:#F5F5F7;font-size:12px;">${kpb.current_price:,.2f} <span style="color:{cc_b};">{chgb:+.2f}%</span></div>'
+                        f'<div style="display:flex;justify-content:space-between;margin-top:6px;align-items:center;"><span class="b" style="background:rgba(191,90,242,0.2);color:#BF5AF2;font-size:9px;">King</span>'
+                        f'<span class="mono" style="font-size:10px;color:rgba(255,255,255,0.5);">{kd_s}</span></div></div>',
+                        unsafe_allow_html=True,
+                    )
+                    fboard = build_vertical_flow_panel(kpb, sgb, tkb, strike_rows, flow_mode)
+                    st.plotly_chart(fboard, use_container_width=True, config={"displayModeBar": False}, key=f"board_{tkb}_{idx}")
                 else:
-                    bar_colors.append("rgba(255,69,58,0.4)")
+                    st.caption("—")
 
-            fig.add_trace(go.Bar(y=[round(l, 2) for l in kp.levels], x=kp.volumes, orientation='h', marker_color=bar_colors, marker_line_width=0, hovertemplate="Price: $%{y:.2f}<br>Volume: %{x:,.0f}<extra></extra>"))
-            fig.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_size=10, annotation_font_color="#F5F5F7")
-            fig.add_hline(y=kp.poc, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"POC ${kp.poc:.2f}", annotation_font_size=10, annotation_font_color="#0A84FF", annotation_position="bottom right")
-            fig.add_hrect(y0=kp.val, y1=kp.vah, fillcolor="rgba(10,132,255,0.06)", line_width=0, annotation_text="Value Area (70%)", annotation_font_size=9, annotation_font_color="rgba(10,132,255,0.5)")
-            fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10), margin=dict(l=0, r=0, t=20, b=0), xaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Volume"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"), height=450, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"vp_{kn_sel}")
-
-        with chart_cols[1]:
-            ladder = go.Figure()
-            max_vol = max(kp.volumes) if kp.volumes else 1.0
-            xs, ys, sizes, colors, labels, hover = [], [], [], [], [], []
-            for kn in kp.king_nodes:
-                side_x = 1 if kn.price_level > kp.current_price else -1 if kn.price_level < kp.current_price else 0
-                base_color = "#0A84FF" if kn.strength == "king" else "#BF5AF2" if kn.strength == "major" else "rgba(255,255,255,0.45)"
-                xs.append(side_x)
-                ys.append(kn.price_level)
-                sizes.append(10 + (kn.volume / max_vol) * 22)
-                colors.append(base_color)
-                labels.append("👑" if kn.strength == "king" else "◆")
-                hover.append(f"${kn.price_level:.2f}<br>{kn.node_type.title()}<br>{kn.volume_pct:.1f}% volume<br>{kn.distance_pct:+.2f}% from current")
-
-            ladder.add_trace(go.Scatter(
-                x=xs,
-                y=ys,
-                mode="markers+text",
-                text=labels,
-                textposition="middle center",
-                marker=dict(size=sizes, color=colors, line=dict(color="rgba(255,255,255,0.3)", width=1)),
-                hovertext=hover,
-                hovertemplate="%{hovertext}<extra></extra>",
-                showlegend=False,
-            ))
-            ladder.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_color="#F5F5F7", annotation_font_size=10)
-            ladder.add_vline(x=0, line_color="rgba(255,255,255,0.15)", line_dash="dot")
-            if top_king:
-                ladder.add_hline(y=top_king.price_level, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"King ${top_king.price_level:.2f}", annotation_font_color="#0A84FF", annotation_font_size=10)
-
-            ladder.update_layout(
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10),
-                margin=dict(l=0, r=0, t=20, b=0),
-                height=450,
-                xaxis=dict(
-                    range=[-1.5, 1.5],
-                    tickmode="array",
-                    tickvals=[-1, 0, 1],
-                    ticktext=["Below Price", "Current", "Above Price"],
-                    gridcolor="rgba(255,255,255,0.04)",
-                    zeroline=False,
-                    title="Vertical Price Ladder",
-                ),
-                yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"),
-                showlegend=False,
-            )
-            st.plotly_chart(ladder, use_container_width=True, config={"displayModeBar": False}, key=f"ladder_{kn_sel}")
-
-        # King node details
-        st.markdown('<p class="sl">Key Levels</p>',unsafe_allow_html=True)
-        kn_cols=st.columns(4)
-        kn_cols[0].metric("POC (Fair Value)",f"${kp.poc:.2f}")
-        kn_cols[1].metric("Value Area High",f"${kp.vah:.2f}")
-        kn_cols[2].metric("Value Area Low",f"${kp.val:.2f}")
-        kn_cols[3].metric("Dominant King", f"${top_king.price_level:.2f}" if top_king else "—")
-
-        def node_strength_weight(node):
-            if not node:
-                return 0.0
-            return 1.0 if node.strength == "king" else 0.75 if node.strength == "major" else 0.45
-
-        def distance_weight(node):
-            if not node:
-                return 0.0
-            d = abs(node.distance_pct)
-            if d <= 1.0:
-                return 1.0
-            if d <= 2.5:
-                return 0.85
-            if d <= 4.0:
-                return 0.65
-            if d <= 6.0:
-                return 0.4
-            return 0.2
-
-        def node_quality_score(node):
-            if not node:
-                return 0.0
-            volume_component = min(1.0, node.volume_pct / 12.0)
-            strength_component = node_strength_weight(node)
-            proximity_component = distance_weight(node)
-            return (0.45 * strength_component) + (0.35 * volume_component) + (0.20 * proximity_component)
-
-        trend_bull = 1 if sig.direction == "bullish" else 0
-        trend_bear = 1 if sig.direction == "bearish" else 0
-        conf_component = min(1.0, sig.confidence / 100.0)
-        vol_confirm = min(1.0, sig.volume_ratio / 2.2)
-        momentum_bull = 1.0 if sig.momentum > 0 and sig.macd_hist > 0 else 0.55 if sig.momentum > 0 else 0.25
-        momentum_bear = 1.0 if sig.momentum < 0 and sig.macd_hist < 0 else 0.55 if sig.momentum < 0 else 0.25
-
-        support_quality = node_quality_score(nearest_below)
-        resistance_quality = node_quality_score(nearest_above)
-        king_location_bull = 1.0 if top_king and top_king.price_level < kp.current_price else 0.45
-        king_location_bear = 1.0 if top_king and top_king.price_level > kp.current_price else 0.45
-
-        call_score_raw = (
-            100
-            * (
-                0.34 * support_quality
-                + 0.16 * king_location_bull
-                + 0.18 * conf_component
-                + 0.14 * vol_confirm
-                + 0.10 * momentum_bull
-                + 0.08 * trend_bull
-            )
-        )
-        put_score_raw = (
-            100
-            * (
-                0.34 * resistance_quality
-                + 0.16 * king_location_bear
-                + 0.18 * conf_component
-                + 0.14 * vol_confirm
-                + 0.10 * momentum_bear
-                + 0.08 * trend_bear
-            )
-        )
-
-        # Penalize setups where nearest structural level is too far to define risk.
-        if nearest_below and abs(nearest_below.distance_pct) > profile_cfg["distance_penalty"]:
-            call_score_raw *= 0.75
-        if nearest_above and abs(nearest_above.distance_pct) > profile_cfg["distance_penalty"]:
-            put_score_raw *= 0.75
-
-        call_conf = min(99, round(call_score_raw, 1))
-        put_conf = min(99, round(put_score_raw, 1))
-        bias = "CALL bias" if call_conf > put_conf else "PUT bias" if put_conf > call_conf else "NEUTRAL"
-        bias_color = "#34C759" if "CALL" in bias else "#FF453A" if "PUT" in bias else "#FFD60A"
-
-        bias_cols = st.columns(3)
-        bias_cols[0].metric("Nearest Support", f"${nearest_below.price_level:.2f}" if nearest_below else "—", f"{nearest_below.distance_pct:+.1f}%" if nearest_below else None)
-        bias_cols[1].metric("Nearest Resistance", f"${nearest_above.price_level:.2f}" if nearest_above else "—", f"{nearest_above.distance_pct:+.1f}%" if nearest_above else None)
-        bias_cols[2].metric("Options Reliability", f"{max(call_conf, put_conf):.0f}%")
-
-        def reliability_label(score):
-            adj_score = score + profile_cfg["reliability_shift"]
-            if adj_score >= 78:
-                return "Institutional Grade"
-            if adj_score >= 65:
-                return "Tradable"
-            if adj_score >= 52:
-                return "Tactical Only"
-            return "Low Edge"
-
-        lead_score = max(call_conf, put_conf)
-        rel_label = reliability_label(lead_score)
-        st.markdown(
-            f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Directional Read from King Nodes</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="mono" style="font-size:13px;font-weight:700;color:{bias_color};">{bias}</span><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.55);">Call {call_conf:.0f}% · Put {put_conf:.0f}%</span></div><div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;"><span class="b" style="background:rgba(255,255,255,0.07);color:#F5F5F7;font-family:\'JetBrains Mono\';font-size:9px;">{rel_label}</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.45);">Model {sig.confidence:.0f}% · RVol {sig.volume_ratio:.1f}x</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);margin-top:6px;line-height:1.4;">Reliability combines node strength, distance from spot, volume concentration, trend/momentum alignment, and model conviction. In {trader_profile.lower()} mode, prefer nearest structural levels within ±{profile_cfg["near_node_pct"]:.1f}% and king/major nodes.</div></div>',
-            unsafe_allow_html=True,
-        )
-
-        # Professional trader execution framing from structure.
-        if bias == "CALL bias" and nearest_below and nearest_above:
-            entry_zone = f"${(nearest_below.price_level + kp.current_price) / 2:.2f}–${kp.current_price:.2f}"
-            invalidation = f"Daily close below ${nearest_below.price_level * 0.995:.2f}"
-            target_1 = f"${nearest_above.price_level:.2f}"
-            target_2 = f"${(nearest_above.price_level + (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
-        elif bias == "PUT bias" and nearest_below and nearest_above:
-            entry_zone = f"${kp.current_price:.2f}–${(nearest_above.price_level + kp.current_price) / 2:.2f}"
-            invalidation = f"Daily close above ${nearest_above.price_level * 1.005:.2f}"
-            target_1 = f"${nearest_below.price_level:.2f}"
-            target_2 = f"${(nearest_below.price_level - (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
+        st.markdown('<p class="sl">Detail ticker</p>', unsafe_allow_html=True)
+        kn_sel = st.selectbox("Ticker", keys_avail, format_func=lambda t: f"{t} — {get_ticker_info(t)[0]}", key="kn_s")
+        kp = king_profiles.get(kn_sel)
+        if not kp:
+            st.warning("No volume profile for this ticker.")
         else:
-            entry_zone = "Wait for cleaner structure"
-            invalidation = "N/A"
-            target_1 = "N/A"
-            target_2 = "N/A"
+            sig = signals[kn_sel]
+            node_by_price = {round(n.price_level, 2): n for n in kp.king_nodes}
+            above_nodes = sorted([n for n in kp.king_nodes if n.price_level > kp.current_price], key=lambda n: n.price_level)
+            below_nodes = sorted([n for n in kp.king_nodes if n.price_level < kp.current_price], key=lambda n: n.price_level, reverse=True)
+            top_king = next((n for n in kp.king_nodes if n.strength == "king"), kp.king_nodes[0] if kp.king_nodes else None)
+            nearest_above = min(above_nodes, key=lambda n: n.price_level - kp.current_price) if above_nodes else None
+            nearest_below = min(below_nodes, key=lambda n: kp.current_price - n.price_level) if below_nodes else None
 
-        size_note = "0.5x size unless Institutional Grade" if trader_profile == "Conservative" else "normal size if Tradable+" if trader_profile == "Balanced" else "can scale faster, respect invalidation strictly"
-        st.markdown(
-            f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Execution Plan (Professional Framing)</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;"><div class="kc"><div class="kl">Entry Zone</div><div class="mono" style="font-size:12px;color:#F5F5F7;">{entry_zone}</div></div><div class="kc"><div class="kl">Invalidation</div><div class="mono" style="font-size:12px;color:#FF9F0A;">{invalidation}</div></div><div class="kc"><div class="kl">Target 1</div><div class="mono" style="font-size:12px;color:#34C759;">{target_1}</div></div><div class="kc"><div class="kl">Target 2</div><div class="mono" style="font-size:12px;color:#34C759;">{target_2}</div></div></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:6px;">Profile rule ({trader_profile}): {size_note}. Reduce size if nearest node is beyond {profile_cfg["distance_penalty"]:.1f}% from spot.</div></div>',
-            unsafe_allow_html=True,
-        )
+            with st.expander("Expiry × strike matrix (detail ticker)", expanded=False):
+                strike_prices = _heatmap_strike_window(kp, strike_rows)
+                if horizon == "1w":
+                    expiry_steps = [0, 3, 7, 10]
+                elif horizon == "2m":
+                    expiry_steps = [0, 14, 30, 45]
+                else:
+                    expiry_steps = [0, 7, 14, 28]
+                expiry_labels = [(pd.Timestamp.today() + pd.Timedelta(days=d)).strftime("%Y-%m-%d") for d in expiry_steps]
 
-        # King node list
-        if kp.king_nodes:
-            st.markdown('<p class="sl">Detected Nodes</p>',unsafe_allow_html=True)
-            cols=st.columns(2)
-            for i,kn in enumerate(kp.king_nodes[:8]):
-                nc="#0A84FF" if kn.strength=="king" else "#BF5AF2" if kn.strength=="major" else "rgba(255,255,255,0.4)"
-                icon="👑" if kn.strength=="king" else "◆" if kn.strength=="major" else "·"
-                type_c="#34C759" if kn.node_type=="support" else "#FF453A" if kn.node_type=="resistance" else "#0A84FF"
-                with cols[i%2]:
-                    st.markdown(f'<div class="kc" style="margin-bottom:6px;"><div style="display:flex;justify-content:space-between;align-items:center;"><div><span style="font-size:14px;">{icon}</span> <span class="mono" style="font-size:14px;font-weight:600;color:{nc};">${kn.price_level:.2f}</span><span class="b" style="background:{type_c}18;color:{type_c};margin-left:6px;font-family:\'JetBrains Mono\';font-size:8px;">{kn.node_type}</span></div><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.4);">{kn.volume_pct:.1f}% vol</span></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:3px;">{kn.distance_pct:+.1f}% from current · {kn.strength.title()} node</div></div>',unsafe_allow_html=True)
+                z_vals = []
+                text_vals = []
+                sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
+                direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
+                for s_px in strike_prices:
+                    row = []
+                    row_text = []
+                    rel_side = 1.0 if s_px < kp.current_price else -1.0
+                    for j, d in enumerate(expiry_steps):
+                        node_influence = 0.0
+                        for kn in kp.king_nodes:
+                            dist = abs(s_px - kn.price_level)
+                            falloff = np.exp(-(dist / sigma) ** 2)
+                            node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
+                            node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
+                            node_influence += node_sign * node_weight * kn.volume_pct * falloff
+                        tenor_decay = max(0.35, 1.0 - j * 0.18)
+                        directional = direction_sign * 22.0 + rel_side * 12.0
+                        seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
+                        raw = (node_influence * 1.8 + directional + seasonal) * tenor_decay
+                        if flow_mode == "Call Pressure":
+                            raw = max(raw, 0.0)
+                        elif flow_mode == "Put Pressure":
+                            raw = min(raw, 0.0)
+                        row.append(raw)
+                        row_text.append(f"${raw:,.1f}K")
+                    z_vals.append(row)
+                    text_vals.append(row_text)
 
-        # All-tickers king node summary
-        st.markdown('<p class="sl">King Node Summary — All Tickers</p>',unsafe_allow_html=True)
-        kn_tbl=[]
-        for t in sorted(king_profiles.keys()):
-            vp=king_profiles[t];s=signals[t]
-            kings=[kn for kn in vp.king_nodes if kn.strength=="king"]
-            nearest=min(vp.king_nodes,key=lambda n:abs(n.distance_pct)) if vp.king_nodes else None
-            kn_tbl.append({"Ticker":t,"Price":f"${vp.current_price:.2f}","POC":f"${vp.poc:.2f}","VAH":f"${vp.vah:.2f}","VAL":f"${vp.val:.2f}","King Nodes":len(kings),"Nearest":f"${nearest.price_level:.2f} ({nearest.distance_pct:+.1f}%)" if nearest else "—","Type":nearest.node_type if nearest else "—"})
-        st.dataframe(pd.DataFrame(kn_tbl),use_container_width=True,hide_index=True,height=min(380,40+len(kn_tbl)*34))
-    else:
-        st.warning("No volume profile data available for this ticker.")
+                heat = go.Figure(
+                    data=[
+                        go.Heatmap(
+                            z=z_vals,
+                            x=expiry_labels,
+                            y=strike_prices,
+                            text=text_vals,
+                            texttemplate="%{text}",
+                            textfont={"size": 10, "color": "rgba(245,245,247,0.92)", "family": "JetBrains Mono"},
+                            colorscale=[
+                                [0.0, "#7A1D2A"],
+                                [0.25, "#4C286B"],
+                                [0.5, "#332455"],
+                                [0.7, "#2E5B88"],
+                                [0.85, "#2EA7B8"],
+                                [1.0, "#FFD166"],
+                            ],
+                            zmid=0,
+                            showscale=False,
+                            hovertemplate="Strike %{y}<br>Expiry %{x}<br>Flow %{z:,.1f}K<extra></extra>",
+                        )
+                    ]
+                )
+                heat.add_hline(
+                    y=kp.current_price,
+                    line_color="rgba(245,245,247,0.6)",
+                    line_width=1.5,
+                    line_dash="dot",
+                )
+                heat.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    margin=dict(l=0, r=0, t=8, b=0),
+                    height=560,
+                    font=dict(family="DM Sans", size=10, color="rgba(255,255,255,0.65)"),
+                    xaxis=dict(side="top", showgrid=False, zeroline=False, title="Expiry"),
+                    yaxis=dict(showgrid=False, zeroline=False, title="Strike", tickformat=".1f"),
+                )
+                st.plotly_chart(heat, use_container_width=True, config={"displayModeBar": False}, key=f"flow_heat_{kn_sel}")
+
+            chart_cols = st.columns(2)
+            with chart_cols[0]:
+                # Volume profile chart (horizontal bar chart of volume at each price level)
+                fig = go.Figure()
+                bar_colors = []
+                for lvl, vol in zip(kp.levels, kp.volumes):
+                    kn = node_by_price.get(round(lvl, 2))
+                    if kn and kn.strength == "king":
+                        bar_colors.append("#0A84FF")
+                    elif kn and kn.strength == "major":
+                        bar_colors.append("#BF5AF2")
+                    elif lvl < kp.current_price:
+                        bar_colors.append("rgba(52,199,89,0.4)")
+                    else:
+                        bar_colors.append("rgba(255,69,58,0.4)")
+
+                fig.add_trace(go.Bar(y=[round(l, 2) for l in kp.levels], x=kp.volumes, orientation='h', marker_color=bar_colors, marker_line_width=0, hovertemplate="Price: $%{y:.2f}<br>Volume: %{x:,.0f}<extra></extra>"))
+                fig.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_size=10, annotation_font_color="#F5F5F7")
+                fig.add_hline(y=kp.poc, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"POC ${kp.poc:.2f}", annotation_font_size=10, annotation_font_color="#0A84FF", annotation_position="bottom right")
+                fig.add_hrect(y0=kp.val, y1=kp.vah, fillcolor="rgba(10,132,255,0.06)", line_width=0, annotation_text="Value Area (70%)", annotation_font_size=9, annotation_font_color="rgba(10,132,255,0.5)")
+                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10), margin=dict(l=0, r=0, t=20, b=0), xaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Volume"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"), height=450, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"vp_{kn_sel}")
+
+            with chart_cols[1]:
+                ladder = go.Figure()
+                max_vol = max(kp.volumes) if kp.volumes else 1.0
+                xs, ys, sizes, colors, labels, hover = [], [], [], [], [], []
+                for kn in kp.king_nodes:
+                    side_x = 1 if kn.price_level > kp.current_price else -1 if kn.price_level < kp.current_price else 0
+                    base_color = "#0A84FF" if kn.strength == "king" else "#BF5AF2" if kn.strength == "major" else "rgba(255,255,255,0.45)"
+                    xs.append(side_x)
+                    ys.append(kn.price_level)
+                    sizes.append(10 + (kn.volume / max_vol) * 22)
+                    colors.append(base_color)
+                    labels.append("👑" if kn.strength == "king" else "◆")
+                    hover.append(f"${kn.price_level:.2f}<br>{kn.node_type.title()}<br>{kn.volume_pct:.1f}% volume<br>{kn.distance_pct:+.2f}% from current")
+
+                ladder.add_trace(go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="markers+text",
+                    text=labels,
+                    textposition="middle center",
+                    marker=dict(size=sizes, color=colors, line=dict(color="rgba(255,255,255,0.3)", width=1)),
+                    hovertext=hover,
+                    hovertemplate="%{hovertext}<extra></extra>",
+                    showlegend=False,
+                ))
+                ladder.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_color="#F5F5F7", annotation_font_size=10)
+                ladder.add_vline(x=0, line_color="rgba(255,255,255,0.15)", line_dash="dot")
+                if top_king:
+                    ladder.add_hline(y=top_king.price_level, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"King ${top_king.price_level:.2f}", annotation_font_color="#0A84FF", annotation_font_size=10)
+
+                ladder.update_layout(
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10),
+                    margin=dict(l=0, r=0, t=20, b=0),
+                    height=450,
+                    xaxis=dict(
+                        range=[-1.5, 1.5],
+                        tickmode="array",
+                        tickvals=[-1, 0, 1],
+                        ticktext=["Below Price", "Current", "Above Price"],
+                        gridcolor="rgba(255,255,255,0.04)",
+                        zeroline=False,
+                        title="Vertical Price Ladder",
+                    ),
+                    yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"),
+                    showlegend=False,
+                )
+                st.plotly_chart(ladder, use_container_width=True, config={"displayModeBar": False}, key=f"ladder_{kn_sel}")
+
+            # King node details
+            st.markdown('<p class="sl">Key Levels</p>',unsafe_allow_html=True)
+            kn_cols=st.columns(4)
+            kn_cols[0].metric("POC (Fair Value)",f"${kp.poc:.2f}")
+            kn_cols[1].metric("Value Area High",f"${kp.vah:.2f}")
+            kn_cols[2].metric("Value Area Low",f"${kp.val:.2f}")
+            kn_cols[3].metric("Dominant King", f"${top_king.price_level:.2f}" if top_king else "—")
+
+            def node_strength_weight(node):
+                if not node:
+                    return 0.0
+                return 1.0 if node.strength == "king" else 0.75 if node.strength == "major" else 0.45
+
+            def distance_weight(node):
+                if not node:
+                    return 0.0
+                d = abs(node.distance_pct)
+                if d <= 1.0:
+                    return 1.0
+                if d <= 2.5:
+                    return 0.85
+                if d <= 4.0:
+                    return 0.65
+                if d <= 6.0:
+                    return 0.4
+                return 0.2
+
+            def node_quality_score(node):
+                if not node:
+                    return 0.0
+                volume_component = min(1.0, node.volume_pct / 12.0)
+                strength_component = node_strength_weight(node)
+                proximity_component = distance_weight(node)
+                return (0.45 * strength_component) + (0.35 * volume_component) + (0.20 * proximity_component)
+
+            trend_bull = 1 if sig.direction == "bullish" else 0
+            trend_bear = 1 if sig.direction == "bearish" else 0
+            conf_component = min(1.0, sig.confidence / 100.0)
+            vol_confirm = min(1.0, sig.volume_ratio / 2.2)
+            momentum_bull = 1.0 if sig.momentum > 0 and sig.macd_hist > 0 else 0.55 if sig.momentum > 0 else 0.25
+            momentum_bear = 1.0 if sig.momentum < 0 and sig.macd_hist < 0 else 0.55 if sig.momentum < 0 else 0.25
+
+            support_quality = node_quality_score(nearest_below)
+            resistance_quality = node_quality_score(nearest_above)
+            king_location_bull = 1.0 if top_king and top_king.price_level < kp.current_price else 0.45
+            king_location_bear = 1.0 if top_king and top_king.price_level > kp.current_price else 0.45
+
+            call_score_raw = (
+                100
+                * (
+                    0.34 * support_quality
+                    + 0.16 * king_location_bull
+                    + 0.18 * conf_component
+                    + 0.14 * vol_confirm
+                    + 0.10 * momentum_bull
+                    + 0.08 * trend_bull
+                )
+            )
+            put_score_raw = (
+                100
+                * (
+                    0.34 * resistance_quality
+                    + 0.16 * king_location_bear
+                    + 0.18 * conf_component
+                    + 0.14 * vol_confirm
+                    + 0.10 * momentum_bear
+                    + 0.08 * trend_bear
+                )
+            )
+
+            if nearest_below and abs(nearest_below.distance_pct) > profile_cfg["distance_penalty"]:
+                call_score_raw *= 0.75
+            if nearest_above and abs(nearest_above.distance_pct) > profile_cfg["distance_penalty"]:
+                put_score_raw *= 0.75
+
+            call_conf = min(99, round(call_score_raw, 1))
+            put_conf = min(99, round(put_score_raw, 1))
+            bias = "CALL bias" if call_conf > put_conf else "PUT bias" if put_conf > call_conf else "NEUTRAL"
+            bias_color = "#34C759" if "CALL" in bias else "#FF453A" if "PUT" in bias else "#FFD60A"
+
+            bias_cols = st.columns(3)
+            bias_cols[0].metric("Nearest Support", f"${nearest_below.price_level:.2f}" if nearest_below else "—", f"{nearest_below.distance_pct:+.1f}%" if nearest_below else None)
+            bias_cols[1].metric("Nearest Resistance", f"${nearest_above.price_level:.2f}" if nearest_above else "—", f"{nearest_above.distance_pct:+.1f}%" if nearest_above else None)
+            bias_cols[2].metric("Options Reliability", f"{max(call_conf, put_conf):.0f}%")
+
+            def reliability_label(score):
+                adj_score = score + profile_cfg["reliability_shift"]
+                if adj_score >= 78:
+                    return "Institutional Grade"
+                if adj_score >= 65:
+                    return "Tradable"
+                if adj_score >= 52:
+                    return "Tactical Only"
+                return "Low Edge"
+
+            lead_score = max(call_conf, put_conf)
+            rel_label = reliability_label(lead_score)
+            st.markdown(
+                f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Directional Read from King Nodes</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="mono" style="font-size:13px;font-weight:700;color:{bias_color};">{bias}</span><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.55);">Call {call_conf:.0f}% · Put {put_conf:.0f}%</span></div><div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;"><span class="b" style="background:rgba(255,255,255,0.07);color:#F5F5F7;font-family:\'JetBrains Mono\';font-size:9px;">{rel_label}</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.45);">Model {sig.confidence:.0f}% · RVol {sig.volume_ratio:.1f}x</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);margin-top:6px;line-height:1.4;">Reliability combines node strength, distance from spot, volume concentration, trend/momentum alignment, and model conviction. In {trader_profile.lower()} mode, prefer nearest structural levels within ±{profile_cfg["near_node_pct"]:.1f}% and king/major nodes.</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            if bias == "CALL bias" and nearest_below and nearest_above:
+                entry_zone = f"${(nearest_below.price_level + kp.current_price) / 2:.2f}–${kp.current_price:.2f}"
+                invalidation = f"Daily close below ${nearest_below.price_level * 0.995:.2f}"
+                target_1 = f"${nearest_above.price_level:.2f}"
+                target_2 = f"${(nearest_above.price_level + (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
+            elif bias == "PUT bias" and nearest_below and nearest_above:
+                entry_zone = f"${kp.current_price:.2f}–${(nearest_above.price_level + kp.current_price) / 2:.2f}"
+                invalidation = f"Daily close above ${nearest_above.price_level * 1.005:.2f}"
+                target_1 = f"${nearest_below.price_level:.2f}"
+                target_2 = f"${(nearest_below.price_level - (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
+            else:
+                entry_zone = "Wait for cleaner structure"
+                invalidation = "N/A"
+                target_1 = "N/A"
+                target_2 = "N/A"
+
+            size_note = "0.5x size unless Institutional Grade" if trader_profile == "Conservative" else "normal size if Tradable+" if trader_profile == "Balanced" else "can scale faster, respect invalidation strictly"
+            st.markdown(
+                f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Execution Plan (Professional Framing)</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;"><div class="kc"><div class="kl">Entry Zone</div><div class="mono" style="font-size:12px;color:#F5F5F7;">{entry_zone}</div></div><div class="kc"><div class="kl">Invalidation</div><div class="mono" style="font-size:12px;color:#FF9F0A;">{invalidation}</div></div><div class="kc"><div class="kl">Target 1</div><div class="mono" style="font-size:12px;color:#34C759;">{target_1}</div></div><div class="kc"><div class="kl">Target 2</div><div class="mono" style="font-size:12px;color:#34C759;">{target_2}</div></div></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:6px;">Profile rule ({trader_profile}): {size_note}. Reduce size if nearest node is beyond {profile_cfg["distance_penalty"]:.1f}% from spot.</div></div>',
+                unsafe_allow_html=True,
+            )
+
+            if kp.king_nodes:
+                st.markdown('<p class="sl">Detected Nodes</p>',unsafe_allow_html=True)
+                cols=st.columns(2)
+                for i,kn in enumerate(kp.king_nodes[:8]):
+                    nc="#0A84FF" if kn.strength=="king" else "#BF5AF2" if kn.strength=="major" else "rgba(255,255,255,0.4)"
+                    icon="👑" if kn.strength=="king" else "◆" if kn.strength=="major" else "·"
+                    type_c="#34C759" if kn.node_type=="support" else "#FF453A" if kn.node_type=="resistance" else "#0A84FF"
+                    with cols[i%2]:
+                        st.markdown(f'<div class="kc" style="margin-bottom:6px;"><div style="display:flex;justify-content:space-between;align-items:center;"><div><span style="font-size:14px;">{icon}</span> <span class="mono" style="font-size:14px;font-weight:600;color:{nc};">${kn.price_level:.2f}</span><span class="b" style="background:{type_c}18;color:{type_c};margin-left:6px;font-family:\'JetBrains Mono\';font-size:8px;">{kn.node_type}</span></div><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.4);">{kn.volume_pct:.1f}% vol</span></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:3px;">{kn.distance_pct:+.1f}% from current · {kn.strength.title()} node</div></div>',unsafe_allow_html=True)
+
+            st.markdown('<p class="sl">King Node Summary — All Tickers</p>',unsafe_allow_html=True)
+            kn_tbl=[]
+            for t in sorted(king_profiles.keys()):
+                vp=king_profiles[t];s=signals[t]
+                kings=[kn for kn in vp.king_nodes if kn.strength=="king"]
+                nearest=min(vp.king_nodes,key=lambda n:abs(n.distance_pct)) if vp.king_nodes else None
+                kn_tbl.append({"Ticker":t,"Price":f"${vp.current_price:.2f}","POC":f"${vp.poc:.2f}","VAH":f"${vp.vah:.2f}","VAL":f"${vp.val:.2f}","King Nodes":len(kings),"Nearest":f"${nearest.price_level:.2f} ({nearest.distance_pct:+.1f}%)" if nearest else "—","Type":nearest.node_type if nearest else "—"})
+            st.dataframe(pd.DataFrame(kn_tbl),use_container_width=True,hide_index=True,height=min(380,40+len(kn_tbl)*34))
 
 st.markdown('<div style="height:16px"></div><p style="font-size:8px;color:rgba(255,255,255,0.08);text-align:center;padding:10px 0;">Signal · yfinance + Finnhub · Educational use only. Not financial advice.</p>',unsafe_allow_html=True)
