@@ -536,6 +536,108 @@ with tab_heat:
         nearest_above = min(above_nodes, key=lambda n: n.price_level - kp.current_price) if above_nodes else None
         nearest_below = min(below_nodes, key=lambda n: kp.current_price - n.price_level) if below_nodes else None
 
+        st.markdown('<p class="sl">Flow Heatmap (Options-Style Layout)</p>', unsafe_allow_html=True)
+        ht1, ht2, ht3, ht4 = st.columns([1.1, 1.1, 1.2, 1.6])
+        with ht1:
+            strike_rows = st.selectbox("Rows", [24, 32, 40], index=1, key="hm_rows")
+        with ht2:
+            horizon = st.selectbox("Horizon", ["1w", "1m", "2m"], index=1, key="hm_horizon")
+        with ht3:
+            flow_mode = st.selectbox("Metric", ["Net Flow", "Call Pressure", "Put Pressure"], index=0, key="hm_metric")
+        with ht4:
+            st.markdown(
+                f'<div class="kc" style="height:70px;"><div class="kl">Board</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="b" style="background:rgba(52,199,89,0.2);color:#34C759;">LIVE</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.55);">{datetime.now().strftime("%H:%M:%S")}</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.32);margin-top:5px;">{kn_sel} spot ${kp.current_price:.2f} · POC ${kp.poc:.2f}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        # Construct an options-style strike x expiry heatmap from node structure.
+        center_idx = min(range(len(kp.levels)), key=lambda i: abs(kp.levels[i] - kp.current_price))
+        half_window = max(10, strike_rows // 2)
+        i0 = max(0, center_idx - half_window)
+        i1 = min(len(kp.levels), center_idx + half_window)
+        strike_slice = kp.levels[i0:i1]
+        strike_prices = sorted([round(x, 2) for x in strike_slice], reverse=True)
+        if len(strike_prices) > strike_rows:
+            step = max(1, len(strike_prices) // strike_rows)
+            strike_prices = strike_prices[::step][:strike_rows]
+
+        if horizon == "1w":
+            expiry_steps = [0, 3, 7, 10]
+        elif horizon == "2m":
+            expiry_steps = [0, 14, 30, 45]
+        else:
+            expiry_steps = [0, 7, 14, 28]
+        expiry_labels = [(pd.Timestamp.today() + pd.Timedelta(days=d)).strftime("%Y-%m-%d") for d in expiry_steps]
+
+        z_vals = []
+        text_vals = []
+        sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
+        direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
+        for s_px in strike_prices:
+            row = []
+            row_text = []
+            rel_side = 1.0 if s_px < kp.current_price else -1.0
+            for j, d in enumerate(expiry_steps):
+                node_influence = 0.0
+                for kn in kp.king_nodes:
+                    dist = abs(s_px - kn.price_level)
+                    falloff = np.exp(-(dist / sigma) ** 2)
+                    node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
+                    node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
+                    node_influence += node_sign * node_weight * kn.volume_pct * falloff
+                tenor_decay = max(0.35, 1.0 - j * 0.18)
+                directional = direction_sign * 22.0 + rel_side * 12.0
+                seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
+                raw = (node_influence * 1.8 + directional + seasonal) * tenor_decay
+                if flow_mode == "Call Pressure":
+                    raw = max(raw, 0.0)
+                elif flow_mode == "Put Pressure":
+                    raw = min(raw, 0.0)
+                row.append(raw)
+                row_text.append(f"${raw:,.1f}K")
+            z_vals.append(row)
+            text_vals.append(row_text)
+
+        heat = go.Figure(
+            data=[
+                go.Heatmap(
+                    z=z_vals,
+                    x=expiry_labels,
+                    y=strike_prices,
+                    text=text_vals,
+                    texttemplate="%{text}",
+                    textfont={"size": 10, "color": "rgba(245,245,247,0.92)", "family": "JetBrains Mono"},
+                    colorscale=[
+                        [0.0, "#7A1D2A"],
+                        [0.25, "#4C286B"],
+                        [0.5, "#332455"],
+                        [0.7, "#2E5B88"],
+                        [0.85, "#2EA7B8"],
+                        [1.0, "#FFD166"],
+                    ],
+                    zmid=0,
+                    showscale=False,
+                    hovertemplate="Strike %{y}<br>Expiry %{x}<br>Flow %{z:,.1f}K<extra></extra>",
+                )
+            ]
+        )
+        heat.add_hline(
+            y=kp.current_price,
+            line_color="rgba(245,245,247,0.6)",
+            line_width=1.5,
+            line_dash="dot",
+        )
+        heat.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=0, t=8, b=0),
+            height=560,
+            font=dict(family="DM Sans", size=10, color="rgba(255,255,255,0.65)"),
+            xaxis=dict(side="top", showgrid=False, zeroline=False, title="Expiry"),
+            yaxis=dict(showgrid=False, zeroline=False, title="Strike", tickformat=".1f"),
+        )
+        st.plotly_chart(heat, use_container_width=True, config={"displayModeBar": False}, key=f"flow_heat_{kn_sel}")
+
         chart_cols = st.columns(2)
         with chart_cols[0]:
             # Volume profile chart (horizontal bar chart of volume at each price level)
