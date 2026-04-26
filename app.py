@@ -25,7 +25,7 @@ except ImportError:
 
 from utils.data import (
     fetch_batch_data, get_ticker_info, classify_stock,
-    LIQUID_UNIVERSE, PENNY_TICKERS_FALLBACK, REFRESH_INTERVALS, CACHE_TTL_MAP,
+    LARGE_CAP_TICKERS, PENNY_TICKERS_FALLBACK, REFRESH_INTERVALS, CACHE_TTL_MAP,
 )
 from utils.screener import get_live_penny_tickers, get_scan_results, SEED_UNIVERSE
 from utils.catalysts import fetch_news, fetch_company_profile, _get_api_key
@@ -34,16 +34,22 @@ from models.predictor import predict_batch_parallel
 from models.pro_scorer import compute_pro_breakout
 from models.options_engine import generate_options_plays
 from models.king_nodes import compute_volume_profile
+from models.zero_dte import compute_0dte_analysis, get_0dte_tickers, get_current_session_window, get_all_session_windows
+from utils.live_quotes import fetch_live_quotes_batch, has_live_data, LiveQuote
+from utils.unusual_whales import (
+    fetch_flow_alerts, fetch_dark_pool, fetch_congress_trades,
+    fetch_uw_news, fetch_stock_screener, has_uw_key,
+)
 
 st.set_page_config(page_title="Signal Pro", page_icon="◉", layout="wide", initial_sidebar_state="expanded")
 FK = bool(_get_api_key())
+UW = has_uw_key()
 
 # ═══ SIDEBAR ══════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### ◉ Signal Config")
     st.markdown("---")
     refresh_choice = st.selectbox("⏱ Refresh", list(REFRESH_INTERVALS.keys()), index=2)
-    trader_profile = st.selectbox("Trader Profile", ["Balanced", "Conservative", "Aggressive"], index=0)
     st.markdown("---")
 
     # Live penny scanner runs automatically
@@ -54,32 +60,53 @@ with st.sidebar:
     st.caption(f"Found {len(live_pennies)} stocks under ${max_penny_price:.0f} from {len(SEED_UNIVERSE)} scanned")
 
     st.markdown("---")
-    ticker_mode = st.radio("Watchlist", ["All (Liquid + Live Pennies)", "Liquid Only (Lg Cap + ETFs)", "Live Pennies Only", "Custom"])
-    if ticker_mode == "All (Liquid + Live Pennies)":
-        selected_tickers = list(set(LIQUID_UNIVERSE + live_pennies))
-    elif ticker_mode == "Liquid Only (Lg Cap + ETFs)":
-        selected_tickers = list(LIQUID_UNIVERSE)
+    ticker_mode = st.radio("Watchlist", ["All (Large + Live Pennies)", "Large Cap Only", "Live Pennies Only", "Custom"])
+    if ticker_mode == "All (Large + Live Pennies)":
+        selected_tickers = list(set(LARGE_CAP_TICKERS + live_pennies))
+    elif ticker_mode == "Large Cap Only":
+        selected_tickers = LARGE_CAP_TICKERS
     elif ticker_mode == "Live Pennies Only":
         selected_tickers = live_pennies if live_pennies else PENNY_TICKERS_FALLBACK
     else:
-        all_avail = list(set(LIQUID_UNIVERSE + live_pennies + PENNY_TICKERS_FALLBACK))
+        all_avail = list(set(LARGE_CAP_TICKERS + live_pennies + PENNY_TICKERS_FALLBACK))
         selected_tickers = st.multiselect("Custom", all_avail, all_avail[:12])
+    # Always include 0DTE tickers
+    dte_must = ["SPY", "QQQ", "IWM"]
+    selected_tickers = list(set(selected_tickers + dte_must))
     st.markdown("---")
     lookback = st.selectbox("Lookback", ["3mo", "6mo", "1y", "2y"], index=1)
     enable_pro = st.checkbox("Pro Scoring", True)
     enable_intraday = st.checkbox("Intraday Data", True)
-    compact_mode = st.checkbox("Compact Cards", True)
     st.markdown("---")
     if FK: st.success("✓ Finnhub connected")
     else:
         st.warning("⚠ No Finnhub key")
         with st.expander("Setup"): st.markdown("Get free key at **finnhub.io** → add `FINNHUB_API_KEY` in Streamlit secrets")
+    if UW: st.success("✓ Unusual Whales connected")
+    else:
+        st.info("🐋 Unusual Whales (optional)")
+        with st.expander("Setup UW"):
+            st.markdown("""
+**Get API key:**
+1. Sign up at [unusualwhales.com](https://unusualwhales.com)
+2. Go to **Settings → API Dashboard**
+   (`unusualwhales.com/settings/api-dashboard`)
+3. Generate your API key
+
+**Add to Streamlit secrets:**
+```
+UW_API_KEY = "your_key_here"
+```
+
+Also works as `UNUSUAL_WHALES_API_KEY` (official MCP convention).
+
+Unlocks: options flow, dark pool, congressional trades, stock screener.
+""")
     st.markdown("---")
     st.markdown("**Definitions**")
     st.markdown("• **Penny stock** = price < $5")
     st.markdown("• **Runner** = under $1 for 12+ months")
     st.markdown("• **King node** = price level with abnormally high traded volume (HVN)")
-    st.caption("Profile changes reliability thresholds and execution strictness.")
 
 if HAS_AR:
     st_autorefresh(interval=REFRESH_INTERVALS[refresh_choice], limit=None, key="ar")
@@ -131,12 +158,6 @@ div[data-baseweb="select"]>div{background:var(--card)!important;border:1px solid
 .pc.volatility::before{background:linear-gradient(90deg,#BF5AF2,#FF6FF1);}
 .tb{background:rgba(255,255,255,0.02);border-left:3px solid rgba(255,255,255,0.1);padding:10px 14px;border-radius:0 7px 7px 0;font-family:'DM Sans';font-size:11px;color:rgba(255,255,255,0.6);line-height:1.5;}
 .lr{display:flex;align-items:center;gap:7px;padding:6px 9px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.05);border-radius:6px;margin-bottom:3px;font-family:'JetBrains Mono';font-size:10px;}
-.opt-card{background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:16px;padding:16px 18px;margin-bottom:14px;}
-.opt-rhrow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px;}
-.opt-cell{background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:10px 12px;}
-.opt-cell em{font-style:normal;font-family:'JetBrains Mono';font-size:15px;font-weight:700;color:#F5F5F7;display:block;margin-top:4px;}
-.hm-head{font-family:'DM Sans';font-size:13px;font-weight:700;color:#F5F5F7;}
-.hm-sub{font-family:'JetBrains Mono';font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px;}
 </style>""", unsafe_allow_html=True)
 
 # ═══ HELPERS ══════════════════════════════════════════════════════
@@ -155,125 +176,6 @@ def to_list(df,c):
 def idx_str(ix):
     try: return [t.isoformat() for t in ix]
     except: return list(ix)
-
-PROFILE_CFG = {
-    "Conservative": {"reliability_shift": 8, "distance_penalty": 5.0, "near_node_pct": 2.0},
-    "Balanced": {"reliability_shift": 0, "distance_penalty": 6.0, "near_node_pct": 3.0},
-    "Aggressive": {"reliability_shift": -6, "distance_penalty": 7.5, "near_node_pct": 4.0},
-}
-profile_cfg = PROFILE_CFG.get(trader_profile, PROFILE_CFG["Balanced"])
-
-
-def _heatmap_strike_window(kp, strike_rows):
-    center_idx = min(range(len(kp.levels)), key=lambda i: abs(kp.levels[i] - kp.current_price))
-    half_window = max(10, strike_rows // 2)
-    i0 = max(0, center_idx - half_window)
-    i1 = min(len(kp.levels), center_idx + half_window)
-    strike_slice = kp.levels[i0:i1]
-    strike_prices = sorted([round(float(x), 2) for x in strike_slice], reverse=True)
-    if len(strike_prices) > strike_rows:
-        step = max(1, len(strike_prices) // strike_rows)
-        strike_prices = strike_prices[::step][:strike_rows]
-    return strike_prices
-
-
-def _strike_flow_scalar(kp, sig, s_px, flow_mode, sigma, j_max=4):
-    direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
-    rel_side = 1.0 if s_px < kp.current_price else -1.0
-    acc = 0.0
-    for j in range(j_max):
-        node_influence = 0.0
-        for kn in kp.king_nodes:
-            dist = abs(s_px - kn.price_level)
-            falloff = np.exp(-((dist / sigma) ** 2))
-            node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
-            node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
-            node_influence += node_sign * node_weight * kn.volume_pct * falloff
-        tenor_decay = max(0.35, 1.0 - j * 0.18)
-        seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
-        raw = (node_influence * 1.8 + direction_sign * 22.0 + rel_side * 12.0 + seasonal) * tenor_decay
-        if flow_mode == "Call Pressure":
-            raw = max(raw, 0.0)
-        elif flow_mode == "Put Pressure":
-            raw = min(raw, 0.0)
-        acc += raw
-    return acc / j_max
-
-
-def build_vertical_flow_panel(kp, sig, ticker: str, strike_rows: int = 28, flow_mode: str = "Net Flow"):
-    """Dense strike ladder + horizontal intensity bars (SPY / QQQ board style)."""
-    strike_prices = _heatmap_strike_window(kp, strike_rows)
-    if not strike_prices:
-        return go.Figure()
-    sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
-    flows = [_strike_flow_scalar(kp, sig, s_px, flow_mode, sigma) for s_px in strike_prices]
-    abs_flows = [abs(f) for f in flows]
-    mx = max(abs_flows) if abs_flows else 1.0
-    mx = mx if mx > 1e-6 else 1.0
-
-    king_level = None
-    if kp.king_nodes:
-        king_node = max(kp.king_nodes, key=lambda n: n.volume)
-        king_level = round(float(king_node.price_level), 2)
-
-    atm_idx = min(range(len(strike_prices)), key=lambda i: abs(strike_prices[i] - kp.current_price))
-
-    colors, line_widths, line_colors = [], [], []
-    for i, (s_px, f) in enumerate(zip(strike_prices, flows)):
-        ni = abs(f) / mx
-        if king_level is not None and abs(s_px - king_level) < 1e-2:
-            colors.append("#4A2F78")
-        elif ni > 0.82:
-            colors.append("#FFD166")
-        elif ni > 0.55:
-            colors.append("#2EA7B8")
-        elif ni > 0.3:
-            colors.append("#256B75")
-        else:
-            colors.append("#2A1F45")
-        lw = 2 if i == atm_idx else 0
-        lc = "rgba(245,245,247,0.95)" if i == atm_idx else "rgba(0,0,0,0)"
-        line_widths.append(lw)
-        line_colors.append(lc)
-
-    y_labels = [f"{p:.1f}" if p >= 50 else f"{p:.2f}" for p in strike_prices]
-    display_text = []
-    for s_px, f in zip(strike_prices, flows):
-        star = " ★" if king_level and abs(s_px - king_level) < 1e-2 else ""
-        sign = "-" if f < 0 else ""
-        display_text.append(f"{sign}${abs(f):,.0f}K{star}")
-
-    fig = go.Figure(
-        data=[
-            go.Bar(
-                y=y_labels,
-                x=abs_flows,
-                orientation="h",
-                marker=dict(color=colors, line=dict(color=line_colors, width=line_widths)),
-                text=display_text,
-                textposition="outside",
-                textfont=dict(size=9, family="JetBrains Mono", color="rgba(245,245,247,0.92)"),
-                customdata=[f"{fv:+,.1f}K" for fv in flows],
-                hovertemplate="Strike %{y}<br>%{customdata}<extra></extra>",
-            )
-        ]
-    )
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(14,10,24,0.9)",
-        margin=dict(l=2, r=6, t=6, b=2),
-        height=min(540, 24 + len(strike_prices) * 17),
-        showlegend=False,
-        xaxis=dict(visible=False, range=[0, mx * 1.42], fixedrange=True),
-        yaxis=dict(
-            showgrid=True,
-            gridcolor="rgba(255,255,255,0.05)",
-            tickfont=dict(size=9, family="JetBrains Mono", color="rgba(255,255,255,0.55)"),
-            autorange="reversed",
-            fixedrange=True,
-        ),
-    )
-    return fig
 
 def runner_score(sig, cl, pf=None, nw=None):
     pts=0;facs=[]
@@ -375,7 +277,7 @@ bear=sum(1 for s in signals.values() if s.direction=="bearish")
 pennies=sum(1 for c in cls.values() if c["is_penny"])
 runners=sum(1 for c in cls.values() if c["is_runner_candidate"])
 sub_d=sum(1 for c in cls.values() if c["is_sub_dollar"])
-king_count=sum(1 for vp in king_profiles.values() for kn in vp.king_nodes if kn.strength=="king")
+king_count=sum(1 for vp in king_profiles.values() for kn in vp.all_nodes if kn.node_type=="king")
 
 c1,c2,c3,c4,c5,c6=st.columns(6)
 c1.metric("Bullish",bull)
@@ -386,63 +288,11 @@ c5.metric("Runners",runners)
 c6.metric("King Nodes",king_count)
 st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
 
-# Desk snapshot for fast decisioning
-high_conf = sum(1 for s in signals.values() if s.confidence >= 70)
-high_rvol = sum(1 for s in signals.values() if s.rvol_5 >= 1.8)
-setup_ready = sum(1 for s in signals.values() if s.confidence >= 65 and s.rvol_5 >= 1.5 and s.direction != "neutral")
-breadth = bull - bear
-if breadth >= max(3, int(0.2 * len(signals))):
-    regime = "Risk-On Trend Day"
-    regime_color = "#34C759"
-elif breadth <= -max(3, int(0.2 * len(signals))):
-    regime = "Risk-Off Tape"
-    regime_color = "#FF453A"
-else:
-    regime = "Mixed / Rotation"
-    regime_color = "#FFD60A"
-ds1, ds2, ds3, ds4 = st.columns(4)
-ds1.metric("Desk Regime", regime)
-ds2.metric("Setup Ready", setup_ready)
-ds3.metric("High Conviction", high_conf)
-ds4.metric("High RVol", high_rvol)
-st.markdown(
-    f'<div class="kc" style="margin-top:4px;"><div style="display:flex;justify-content:space-between;align-items:center;"><span class="mono" style="font-size:11px;color:{regime_color};font-weight:700;">{regime}</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.4);">Breadth {breadth:+d} · Profile {trader_profile}</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);margin-top:5px;">Prioritize names where direction, confidence, and participation agree. In {trader_profile.lower()} mode, entries favor structural levels within ±{profile_cfg["near_node_pct"]:.1f}% of spot.</div></div>',
-    unsafe_allow_html=True,
-)
-st.markdown("<div style='height:8px'></div>",unsafe_allow_html=True)
-
 # ═══ TABS ═════════════════════════════════════════════════════════
-tab_ov,tab_run,tab_brk,tab_det,tab_opt,tab_heat=st.tabs(["◉ Overview","🚀 Penny Runners","🔥 Breakout","◎ Detail","⬡ Options","👑 King Nodes"])
+tab_ov,tab_0dte,tab_run,tab_flow,tab_brk,tab_det,tab_opt,tab_heat=st.tabs(["◉ Overview","⚡ 0DTE","🚀 Penny Runners","🐋 Flow","🔥 Breakout","◎ Detail","⬡ Options","👑 King Nodes"])
 
 # ═══ TAB 1: OVERVIEW ═════════════════════════════════════════════
 with tab_ov:
-    # Priority watchlist for at-a-glance execution ranking.
-    watch_rows = []
-    for t, s in signals.items():
-        kp = king_profiles.get(t)
-        nearest_node = None
-        if kp and kp.king_nodes:
-            nearest_node = min(kp.king_nodes, key=lambda n: abs(n.distance_pct))
-        node_dist = abs(nearest_node.distance_pct) if nearest_node else 99.0
-        setup_score = (
-            0.45 * s.confidence
-            + 0.30 * min(100, s.rvol_5 * 30)
-            + 0.25 * max(0, 100 - node_dist * 20)
-        )
-        watch_rows.append({
-            "Ticker": t,
-            "Dir": s.direction[0].upper(),
-            "Score": round(setup_score, 1),
-            "Conf": f"{s.confidence:.0f}%",
-            "RVol": f"{s.rvol_5:.1f}x",
-            "Nearest Node": f"{node_dist:.1f}%" if nearest_node else "—",
-            "Node": nearest_node.strength.title() if nearest_node else "—",
-            "Last": f"${s.price:.2f}",
-        })
-    watch_df = pd.DataFrame(sorted(watch_rows, key=lambda r: r["Score"], reverse=True)[:8])
-    st.markdown('<p class="sl">Priority Watchlist</p>', unsafe_allow_html=True)
-    st.dataframe(watch_df, use_container_width=True, hide_index=True, height=320)
-
     sk=(lambda s:pro_scores[s.ticker].total_score) if pro_scores else (lambda s:s.confidence)
     ss_list=sorted(signals.values(),key=sk,reverse=True)
     cols=st.columns(3)
@@ -458,16 +308,125 @@ with tab_ov:
         # King node badge
         kp=king_profiles.get(sig.ticker)
         if kp:
-            kings=[kn for kn in kp.king_nodes if kn.strength=="king"]
+            kings=[kn for kn in kp.all_nodes if kn.node_type=="king"]
             if kings: badges+=f' <span class="b bking">👑 {len(kings)} King</span>'
         with cols[i%3]:
             with st.container(border=True):
-                card_pad = "10px" if compact_mode else "14px"
-                st.markdown(f'<div style="padding:{card_pad};"><div style="display:flex;justify-content:space-between;"><div><span style="font-family:\'DM Sans\';font-size:17px;font-weight:700;color:#F5F5F7;">{sig.ticker}</span><span style="font-size:9px;color:rgba(255,255,255,0.2);margin-left:5px;">{tier}</span>{badges}</div><span class="b {bc}">{ico(sig.direction)} {sig.direction.title()}</span></div><div style="margin:5px 0;"><span class="mono" style="font-size:18px;font-weight:600;color:#F5F5F7;">${sig.price:,.2f}</span><span class="mono" style="font-size:10px;color:{cc};margin-left:6px;">{"+" if sig.change_1d>=0 else ""}{sig.change_1d:.2f}%</span></div><div style="display:flex;gap:7px;font-family:\'JetBrains Mono\';font-size:9px;"><span style="color:rgba(255,255,255,0.3);">Conf</span><span style="color:{c};font-weight:600;">{sig.confidence}%</span> <span style="color:rgba(255,255,255,0.3);">RVol</span><span>{sig.volume_ratio}x</span> <span style="color:{g};font-weight:700;">{grade}</span></div></div>',unsafe_allow_html=True)
+                st.markdown(f'<div style="display:flex;justify-content:space-between;"><div><span style="font-family:\'DM Sans\';font-size:17px;font-weight:700;color:#F5F5F7;">{sig.ticker}</span><span style="font-size:9px;color:rgba(255,255,255,0.2);margin-left:5px;">{tier}</span>{badges}</div><span class="b {bc}">{ico(sig.direction)} {sig.direction.title()}</span></div><div style="margin:5px 0;"><span class="mono" style="font-size:18px;font-weight:600;color:#F5F5F7;">${sig.price:,.2f}</span><span class="mono" style="font-size:10px;color:{cc};margin-left:6px;">{"+" if sig.change_1d>=0 else ""}{sig.change_1d:.2f}%</span></div><div style="display:flex;gap:7px;font-family:\'JetBrains Mono\';font-size:9px;"><span style="color:rgba(255,255,255,0.3);">Conf</span><span style="color:{c};font-weight:600;">{sig.confidence}%</span> <span style="color:rgba(255,255,255,0.3);">RVol</span><span>{sig.volume_ratio}x</span> <span style="color:{g};font-weight:700;">{grade}</span></div>',unsafe_allow_html=True)
                 t0=sig.signals[0] if sig.signals else "—"
                 st.markdown(f'<div style="margin-top:5px;padding-top:5px;border-top:1px solid rgba(255,255,255,0.04);font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.4);">{t0}</div>',unsafe_allow_html=True)
 
-# ═══ TAB 2: PENNY RUNNERS ════════════════════════════════════════
+# ═══ TAB 2: 0DTE ══════════════════════════════════════════════════
+with tab_0dte:
+    st.markdown('<p class="sl">⚡ 0DTE Command Center — SPY · QQQ · IWM</p>',unsafe_allow_html=True)
+
+    # Session window banner
+    cw=get_current_session_window()
+    if cw:
+        st.markdown(f'<div style="padding:12px 16px;background:{cw["color"]}12;border:1px solid {cw["color"]}30;border-radius:10px;margin-bottom:14px;"><div style="display:flex;align-items:center;gap:10px;"><span class="b" style="background:{cw["color"]}25;color:{cw["color"]};font-family:\'JetBrains Mono\';font-size:10px;">{cw["name"].upper()}</span><span style="font-family:\'DM Sans\';font-size:12px;color:rgba(255,255,255,0.6);">{cw["action"]}</span></div></div>',unsafe_allow_html=True)
+    else:
+        st.markdown('<div style="padding:12px 16px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;margin-bottom:14px;"><div style="font-family:\'DM Sans\';font-size:12px;color:rgba(255,255,255,0.5);">Market closed. Use this time to identify key levels and plan entries for the next session. Review the session windows below.</div></div>',unsafe_allow_html=True)
+
+    # Session windows timeline
+    with st.expander("📅 0DTE Session Windows (all times ET)", expanded=False):
+        for w in get_all_session_windows():
+            st.markdown(f'<div style="display:flex;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span class="mono" style="font-size:10px;color:{w["color"]};font-weight:600;width:90px;">{w["start"]}–{w["end"]}</span><span style="font-family:\'DM Sans\';font-size:11px;color:rgba(255,255,255,0.5);"><strong style="color:{w["color"]};">{w["name"]}</strong> — {w["action"]}</span></div>',unsafe_allow_html=True)
+
+    # 0DTE analysis for each key ticker
+    dte_tickers=get_0dte_tickers()
+    # Make sure we have data for these
+    dte_avail=[t for t in dte_tickers if t in data_dict]
+    if not dte_avail:
+        st.warning("No 0DTE ticker data available. Make sure SPY, QQQ, or IWM are in your watchlist.")
+    else:
+        # Fetch live quotes for 0DTE tickers (15s cache)
+        live_q = fetch_live_quotes_batch(tuple(dte_avail)) if has_live_data() else {}
+        if live_q:
+            lq_time = next(iter(live_q.values())).updated_at if live_q else "N/A"
+            st.markdown(f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;"><span class="ld" style="background:#34C759;width:5px;height:5px;"></span><span class="mono" style="font-size:9px;color:rgba(255,255,255,0.3);">LIVE QUOTES · Updated {lq_time} · 15s refresh</span></div>',unsafe_allow_html=True)
+
+        cols=st.columns(len(dte_avail))
+        for i,t in enumerate(dte_avail):
+            # Get intraday data if available
+            idict_local={}
+            if enable_intraday:
+                from utils.intraday import fetch_intraday_5m
+                idf=fetch_intraday_5m(t, days=5)
+                if idf is not None: idict_local[t]=idf
+
+            analysis=compute_0dte_analysis(t, data_dict[t], idict_local.get(t))
+            if not analysis:
+                with cols[i]:
+                    st.warning(f"No analysis for {t}")
+                continue
+
+            sig=signals.get(t)
+            kp=king_profiles.get(t)
+            a=analysis
+
+            with cols[i]:
+                with st.container(border=True):
+                    # Header
+                    orb_c="#34C759" if a.orb_broken=="above" else "#FF453A" if a.orb_broken=="below" else "#FFD60A"
+                    orb_t="▲ ABOVE ORB" if a.orb_broken=="above" else "▼ BELOW ORB" if a.orb_broken=="below" else "◆ INSIDE ORB"
+                    st.markdown(f'<div style="display:flex;justify-content:space-between;align-items:center;"><span style="font-family:\'DM Sans\';font-size:22px;font-weight:700;color:#F5F5F7;">{t}</span><span class="b" style="background:{orb_c}18;color:{orb_c};font-family:\'JetBrains Mono\';font-size:9px;">{orb_t}</span></div>',unsafe_allow_html=True)
+
+                    # Price — use live quote if available, else analysis price
+                    lq = live_q.get(t)
+                    display_price = lq.current if lq else a.current_price
+                    display_change = lq.change_pct if lq else 0
+                    price_color = "#34C759" if display_change >= 0 else "#FF453A"
+                    live_badge = f'<span class="mono" style="font-size:8px;color:rgba(52,199,89,0.6);">● LIVE</span>' if lq else '<span class="mono" style="font-size:8px;color:rgba(255,255,255,0.2);">● DELAYED</span>'
+
+                    st.markdown(f'<div style="display:flex;align-items:baseline;gap:8px;margin:6px 0;"><span class="mono" style="font-size:24px;font-weight:600;color:#F5F5F7;">${display_price:,.2f}</span><span class="mono" style="font-size:12px;color:{price_color};">{display_change:+.2f}%</span>{live_badge}</div>',unsafe_allow_html=True)
+                    st.markdown(f'<div style="display:flex;gap:8px;font-family:\'JetBrains Mono\';font-size:10px;margin-bottom:8px;"><span style="color:rgba(255,255,255,0.3);">Expected Move</span><span style="color:#F5F5F7;">±${a.expected_move_1sd:.2f} ({a.expected_move_pct:.2f}%)</span></div>',unsafe_allow_html=True)
+
+                    # Expected range bar
+                    st.markdown(f'<div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;color:rgba(255,255,255,0.3);"><span>${a.expected_range_low:.2f}</span><span style="color:#F5F5F7;">← 1σ Range →</span><span>${a.expected_range_high:.2f}</span></div><div class="sb" style="margin-top:3px;"><div style="height:100%;width:50%;background:linear-gradient(90deg,#FF453A,rgba(255,255,255,0.1),#34C759);border-radius:3px;margin:0 auto;"></div></div>',unsafe_allow_html=True)
+
+                    # Key levels
+                    st.markdown(f'<div style="margin-top:10px;"><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:rgba(255,255,255,0.3);">VWAP</span><span style="color:#0A84FF;font-weight:600;">${a.intraday_vwap:.2f}</span></div><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:rgba(255,255,255,0.3);">ORB High</span><span style="color:#34C759;">${a.opening_range_high:.2f}</span></div><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:rgba(255,255,255,0.3);">ORB Low</span><span style="color:#FF453A;">${a.opening_range_low:.2f}</span></div><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="color:rgba(255,255,255,0.3);">Day High</span><span>${a.intraday_high:.2f}</span></div><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:3px 0;"><span style="color:rgba(255,255,255,0.3);">Day Low</span><span>${a.intraday_low:.2f}</span></div></div>',unsafe_allow_html=True)
+
+                    # King nodes for this ticker
+                    if kp and kp.all_nodes:
+                        kings=[n for n in kp.all_nodes if n.node_type in ("king","gatekeeper")][:3]
+                        if kings:
+                            st.markdown('<div style="margin-top:8px;">',unsafe_allow_html=True)
+                            for kn in kings:
+                                kc="#0A84FF" if kn.node_type=="king" else "#FF9F0A"
+                                ki="👑" if kn.node_type=="king" else "🛡"
+                                st.markdown(f'<div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;padding:2px 0;"><span style="color:{kc};">{ki} {kn.node_type.title()}</span><span style="color:{kc};font-weight:600;">${kn.price_level:.2f}</span><span style="color:rgba(255,255,255,0.25);">{kn.distance_pct:+.1f}%</span></div>',unsafe_allow_html=True)
+                            st.markdown('</div>',unsafe_allow_html=True)
+
+                    # Regime
+                    rc={"trending":"#34C759","range_bound":"#FFD60A","volatile":"#FF453A"}.get(a.regime,"#F5F5F7")
+                    st.markdown(f'<div style="margin-top:10px;padding:8px 10px;background:{rc}08;border:1px solid {rc}20;border-radius:7px;"><span class="b" style="background:{rc}20;color:{rc};font-family:\'JetBrains Mono\';font-size:8px;">{a.regime.replace("_"," ").upper()}</span><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.45);margin-top:4px;line-height:1.4;">{a.regime_strategy}</div></div>',unsafe_allow_html=True)
+
+                    # Theta
+                    st.markdown(f'<div style="margin-top:8px;display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;"><span style="color:rgba(255,255,255,0.3);">⏳ Theta/hr</span><span style="color:#FF9F0A;">${a.theta_per_hour:.2f}</span></div><div style="display:flex;justify-content:space-between;font-family:\'JetBrains Mono\';font-size:9px;"><span style="color:rgba(255,255,255,0.3);">Time left</span><span>{a.minutes_to_close}min</span></div>',unsafe_allow_html=True)
+
+        # Strategies section (full width)
+        st.markdown('<p class="sl">0DTE Strategy Recommendations</p>',unsafe_allow_html=True)
+        # Use the first available ticker's analysis
+        if dte_avail:
+            main_a = compute_0dte_analysis(dte_avail[0], data_dict[dte_avail[0]],
+                                           idict_local.get(dte_avail[0]) if 'idict_local' in dir() else None)
+            if main_a and main_a.strategies:
+                scols=st.columns(min(3,len(main_a.strategies)))
+                for si,(sname,sdesc,srisk) in enumerate(main_a.strategies[:3]):
+                    risk_c="#34C759" if srisk=="conservative" else "#FFD60A" if srisk=="moderate" else "#FF453A" if srisk=="aggressive" else "rgba(255,255,255,0.4)"
+                    with scols[si%3]:
+                        st.markdown(f'<div class="kc"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><span style="font-family:\'DM Sans\';font-size:13px;font-weight:700;color:#F5F5F7;">{sname}</span><span class="b" style="background:{risk_c}18;color:{risk_c};font-family:\'JetBrains Mono\';font-size:8px;">{srisk}</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.5);line-height:1.5;">{sdesc}</div></div>',unsafe_allow_html=True)
+
+        # Risk management
+        st.markdown('<p class="sl">⚠ 0DTE Risk Rules</p>',unsafe_allow_html=True)
+        if main_a:
+            r1,r2,r3=st.columns(3)
+            r1.markdown(f'<div class="kc"><div class="kl">Max Position Size</div><div class="kv">{main_a.max_position_size_pct}%</div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:2px;">of account per trade</div></div>',unsafe_allow_html=True)
+            r2.markdown(f'<div class="kc"><div class="kl">Stop Loss Rule</div><div style="font-family:\'DM Sans\';font-size:11px;color:rgba(255,255,255,0.5);margin-top:4px;">{main_a.suggested_stop}</div></div>',unsafe_allow_html=True)
+            r3.markdown(f'<div class="kc"><div class="kl">Time Stop</div><div style="font-family:\'DM Sans\';font-size:11px;color:#FF9F0A;margin-top:4px;">{main_a.time_stop}</div></div>',unsafe_allow_html=True)
+
+# ═══ TAB 3: PENNY RUNNERS ════════════════════════════════════════
 with tab_run:
     p_sigs={t:s for t,s in signals.items() if cls.get(t,{}).get("is_penny") or cls.get(t,{}).get("is_runner_candidate")}
     if not p_sigs:
@@ -518,7 +477,94 @@ with tab_run:
     tbl=[{"Ticker":t,"Price":f"${p_sigs[t].price:,.4f}","Tier":cls.get(t,{}).get("tier","?"),"Mo<$1":cls.get(t,{}).get("months_under_1",0),"Runner":"🚀" if cls.get(t,{}).get("is_runner_candidate") else "—","1D%":f"{p_sigs[t].change_1d:+.2f}%","RVol":f"{p_sigs[t].rvol_5:.1f}x","Squeeze":"🔥" if p_sigs[t].squeeze_on else "—","Score":rd[t][0],"Grade":rd[t][1]} for t in sp]
     st.dataframe(pd.DataFrame(tbl),use_container_width=True,hide_index=True,height=min(380,40+len(tbl)*34))
 
-# ═══ TAB 3: BREAKOUT ═════════════════════════════════════════════
+# ═══ TAB 3: FLOW (Unusual Whales) ═════════════════════════════════
+with tab_flow:
+    if not UW:
+        st.markdown('<p class="sl">🐋 Unusual Whales — Live Options Flow, Dark Pool & Congressional Trades</p>',unsafe_allow_html=True)
+        st.markdown('<div style="font-family:\'DM Sans\';font-size:12px;color:rgba(255,255,255,0.4);margin-bottom:14px;line-height:1.6;">Connect Unusual Whales to see real-time institutional options flow, dark pool activity, and what Congress is trading. This is the raw data professional traders use to front-run institutional moves.</div>',unsafe_allow_html=True)
+        st.info("🐋 Add `UW_API_KEY` in Streamlit secrets to enable this tab. Get your key at **unusualwhales.com/settings/api-dashboard**")
+    else:
+        st.markdown('<p class="sl">🐋 Live Market Intelligence — Unusual Whales</p>',unsafe_allow_html=True)
+
+        fl_col1,fl_col2,fl_col3=st.columns(3)
+
+        # ── Options Flow Alerts ────────────────────────────
+        with fl_col1:
+            st.markdown('<p class="sl" style="margin-top:0;">⚡ Options Flow Alerts</p>',unsafe_allow_html=True)
+            flow_alerts=fetch_flow_alerts(limit=15)
+            if flow_alerts:
+                for fa in flow_alerts[:10]:
+                    sc_c="#34C759" if fa.sentiment=="bullish" else "#FF453A" if fa.sentiment=="bearish" else "rgba(255,255,255,0.4)"
+                    prem_fmt=f"${fa.premium:,.0f}" if fa.premium>=1000 else f"${fa.premium:.0f}"
+                    st.markdown(
+                        f'<div class="nc {"bullish" if fa.sentiment=="bullish" else "bearish" if fa.sentiment=="bearish" else ""}" style="padding:8px 10px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<div><span style="font-family:\'DM Sans\';font-size:14px;font-weight:700;color:#F5F5F7;">{fa.ticker}</span>'
+                        f' <span class="b" style="background:{sc_c}18;color:{sc_c};font-family:\'JetBrains Mono\';font-size:8px;">{fa.option_type.upper()} {fa.sentiment}</span></div>'
+                        f'<span class="mono" style="font-size:12px;font-weight:600;color:{sc_c};">{prem_fmt}</span></div>'
+                        f'<div style="font-family:\'JetBrains Mono\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:3px;">'
+                        f'${fa.strike:.0f} {fa.option_type.upper()} exp {fa.expiry[:10]} · vol {fa.volume:,} · OI {fa.open_interest:,}</div>'
+                        f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.25);margin-top:2px;">{fa.alert_rule}</div>'
+                        f'</div>',unsafe_allow_html=True)
+            else:
+                st.caption("No flow alerts available. May be outside market hours or API rate limited.")
+
+        # ── Dark Pool ─────────────────────────────────────
+        with fl_col2:
+            st.markdown('<p class="sl" style="margin-top:0;">🌑 Dark Pool Activity</p>',unsafe_allow_html=True)
+            dp_trades=fetch_dark_pool(limit=12)
+            if dp_trades:
+                for dp in dp_trades[:10]:
+                    not_fmt=f"${dp.notional/1_000_000:.1f}M" if dp.notional>=1_000_000 else f"${dp.notional/1000:.0f}K"
+                    st.markdown(
+                        f'<div class="kc" style="margin-bottom:4px;padding:7px 10px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<span style="font-family:\'DM Sans\';font-size:13px;font-weight:700;color:#F5F5F7;">{dp.ticker}</span>'
+                        f'<span class="mono" style="font-size:11px;color:#0A84FF;font-weight:600;">{not_fmt}</span></div>'
+                        f'<div style="font-family:\'JetBrains Mono\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:2px;">'
+                        f'{dp.size:,} shares @ ${dp.price:.2f}</div>'
+                        f'</div>',unsafe_allow_html=True)
+            else:
+                st.caption("No dark pool data available.")
+
+        # ── Congressional Trades ──────────────────────────
+        with fl_col3:
+            st.markdown('<p class="sl" style="margin-top:0;">🏛️ Congressional Trades</p>',unsafe_allow_html=True)
+            congress=fetch_congress_trades(limit=12)
+            if congress:
+                for ct in congress[:10]:
+                    tx_c="#34C759" if "purchase" in ct.transaction_type.lower() else "#FF453A"
+                    tx_icon="🟢" if "purchase" in ct.transaction_type.lower() else "🔴"
+                    st.markdown(
+                        f'<div class="kc" style="margin-bottom:4px;padding:7px 10px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<div><span style="font-size:11px;">{tx_icon}</span> <span style="font-family:\'DM Sans\';font-size:12px;font-weight:600;color:#F5F5F7;">{ct.ticker}</span></div>'
+                        f'<span class="mono" style="font-size:10px;color:{tx_c};">{ct.transaction_type.title()}</span></div>'
+                        f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:2px;">{ct.politician} · {ct.amount} · {ct.date[:10]}</div>'
+                        f'</div>',unsafe_allow_html=True)
+            else:
+                st.caption("No congressional trade data available.")
+
+        # ── UW Stock Screener for Penny Stocks ────────────
+        st.markdown('<p class="sl">🔍 UW Penny Stock Screener (Volume Leaders Under $5)</p>',unsafe_allow_html=True)
+        uw_pennies=fetch_stock_screener(min_volume=200000,max_price=5.0)
+        if uw_pennies:
+            cols=st.columns(3)
+            for i,res in enumerate(uw_pennies[:12]):
+                cc="#34C759" if res.change_pct>=0 else "#FF453A"
+                with cols[i%3]:
+                    st.markdown(
+                        f'<div class="kc" style="margin-bottom:4px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<span style="font-family:\'DM Sans\';font-size:14px;font-weight:700;color:#F5F5F7;">{res.ticker}</span>'
+                        f'<span class="mono" style="font-size:12px;font-weight:600;color:{cc};">{res.change_pct:+.1f}%</span></div>'
+                        f'<div style="font-family:\'JetBrains Mono\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:2px;">'
+                        f'${res.price:.3f} · Vol {res.volume/1_000_000:.1f}M · MCap ${res.market_cap/1_000_000:.0f}M</div>'
+                        f'</div>',unsafe_allow_html=True)
+        else:
+            st.caption("No screener results. UW screener may not be available on free tier.")
+
+# ═══ TAB 4: BREAKOUT ═════════════════════════════════════════════
 with tab_brk:
     fc1,fc2=st.columns([1,1])
     with fc1: ms=st.slider("Min Score",0,150 if pro_scores else 100,30,5)
@@ -568,10 +614,11 @@ with tab_det:
         # King node lines
         kp=king_profiles.get(sel)
         if kp:
-            for kn in kp.king_nodes[:5]:
-                lc="#0A84FF" if kn.strength=="king" else "#BF5AF2" if kn.strength=="major" else "rgba(255,255,255,0.15)"
-                lw=2 if kn.strength=="king" else 1
-                fig.add_hline(y=kn.price_level,line_dash="dot",line_color=lc,line_width=lw,annotation_text=f"{'👑' if kn.strength=='king' else '◆'} ${kn.price_level:.2f} ({kn.volume_pct:.0f}%vol)",annotation_font_size=9,annotation_font_color=lc,row=1,col=1)
+            for kn in kp.all_nodes[:5]:
+                lc="#0A84FF" if kn.node_type=="king" else "#FFD60A" if kn.polarity=="pika" else "#BF5AF2" if kn.polarity=="barney" else "rgba(255,255,255,0.15)"
+                lw=2 if kn.node_type=="king" else 1
+                icon="👑" if kn.node_type=="king" else "🟡" if kn.polarity=="pika" else "🟣" if kn.polarity=="barney" else "🛡"
+                fig.add_hline(y=kn.price_level,line_dash="dot",line_color=lc,line_width=lw,annotation_text=f"{icon} ${kn.price_level:.2f} ({kn.volume_pct:.0f}%)",annotation_font_size=9,annotation_font_color=lc,row=1,col=1)
         fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font=dict(family="DM Sans",color="rgba(255,255,255,0.5)",size=10),margin=dict(l=0,r=0,t=20,b=0),xaxis=dict(gridcolor="rgba(255,255,255,0.04)"),yaxis=dict(gridcolor="rgba(255,255,255,0.04)"),height=380,showlegend=False,xaxis_rangeslider_visible=False)
         st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False},key=f"dc_{sel}")
     # Signals + News
@@ -589,531 +636,141 @@ with tab_det:
 
 # ═══ TAB 5: OPTIONS ══════════════════════════════════════════════
 with tab_opt:
-    st.markdown('<p class="sl">Options desk</p>', unsafe_allow_html=True)
-    st.caption("Robinhood-style limit band, take-profit / stop on premium, and stock context. Estimates only — not live quotes.")
-    ot = st.selectbox("Underlying", list(signals.keys()), format_func=lambda t: f"{t} — {signals[t].direction.title()}", key="o_s")
-
-    @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice, 120), show_spinner=False)
-    def gp(tk, sh, lb):
-        s, d = signals.get(tk), data_dict.get(tk)
-        return generate_options_plays(s, d) if s and d is not None else []
-
-    sig = signals[ot]
-    plays = gp(ot, f"{ot}_{sig.confidence}", lookback)
-    if not plays:
-        st.warning(f"No plays for {ot}. Try another ticker or enable ETFs / large caps in the watchlist.")
+    ot=st.selectbox("Ticker",list(signals.keys()),format_func=lambda t:f"{t} — {signals[t].direction.title()}",key="o_s")
+    @st.cache_data(ttl=CACHE_TTL_MAP.get(refresh_choice,120),show_spinner=False)
+    def gp(tk,sh,lb):
+        s,d=signals.get(tk),data_dict.get(tk)
+        return generate_options_plays(s,d) if s and d is not None else []
+    sig=signals[ot];plays=gp(ot,f"{ot}_{sig.confidence}",lookback)
+    if not plays: st.warning(f"No plays for {ot}.")
     else:
         for play in plays:
-            pt = play.price_target
-            tc = {
-                "directional_bullish": ("#34C759", "rgba(52,199,89,0.14)"),
-                "directional_bearish": ("#FF453A", "rgba(255,69,58,0.14)"),
-                "neutral": ("#0A84FF", "rgba(10,132,255,0.14)"),
-                "volatility": ("#BF5AF2", "rgba(191,90,242,0.14)"),
-            }
-            t_c, t_b = tc.get(play.strategy_type, ("#FFD60A", "rgba(255,214,10,0.14)"))
-            is_credit = play.strategy_type == "neutral" or "Short" in play.strategy_name
-            prem = float(play.entry_price) or 0.01
-            if is_credit:
-                lim_lo, lim_hi = round(prem * 0.92, 2), round(prem * 1.08, 2)
-                limit_hint = f"Collect ≥ ${lim_lo:.2f} · ideal ${prem:.2f} · max give ${lim_hi:.2f} credit"
-            else:
-                lim_lo, lim_hi = round(prem * 0.97, 2), round(prem * 1.05, 2)
-                limit_hint = f"Pay ≤ ${lim_hi:.2f} · target ${prem:.2f} · stretch ${lim_lo:.2f} debit"
-            tp_pct = ((play.profit_target / prem) - 1.0) * 100.0 if prem else 0.0
-            sl_pct = ((play.stop_loss / prem) - 1.0) * 100.0 if prem else 0.0
-            chg_c = "#34C759" if sig.change_1d >= 0 else "#FF453A"
-            et = play.exit_timing or ""
-            et_short = (et[:72] + "…") if len(et) > 72 else et
+            tc={"directional_bullish":("#34C759","rgba(52,199,89,0.12)"),"directional_bearish":("#FF453A","rgba(255,69,58,0.12)"),"neutral":("#0A84FF","rgba(10,132,255,0.12)"),"volatility":("#BF5AF2","rgba(191,90,242,0.12)")}
+            t_c,t_b=tc.get(play.strategy_type,("#FFD60A","rgba(255,214,10,0.12)"))
+            ccc="bullish" if "bullish" in play.strategy_type else "bearish" if "bearish" in play.strategy_type else "volatility" if play.strategy_type=="volatility" else "neutral"
+            st.markdown(f'<div class="pc {ccc}">',unsafe_allow_html=True)
+            pc1,pc2=st.columns([3,1])
+            with pc1: st.markdown(f'<div style="font-family:\'DM Sans\';font-size:18px;font-weight:700;color:#F5F5F7;">{play.strategy_name}</div><div style="display:flex;gap:4px;margin-top:2px;"><span class="b" style="background:{t_b};color:{t_c};font-family:\'JetBrains Mono\';font-size:8px;">{play.strategy_type.replace("_"," ")}</span><span class="b" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.5);font-family:\'JetBrains Mono\';font-size:8px;">{play.risk_tier}</span></div>',unsafe_allow_html=True)
+            with pc2: st.markdown(f'<div style="text-align:right;"><div class="kl">PoP</div><div class="mono" style="font-size:22px;font-weight:700;color:{t_c};">{play.probability_of_profit}%</div></div>',unsafe_allow_html=True)
+            for leg in play.legs:
+                dc="#34C759" if leg.direction=="buy" else "#FF6961"
+                db="rgba(52,199,89,0.15)" if leg.direction=="buy" else "rgba(255,105,97,0.15)"
+                st.markdown(f'<div class="lr"><span style="background:{db};color:{dc};font-weight:700;font-size:8px;padding:1px 4px;border-radius:3px;text-transform:uppercase;">{leg.direction}</span><span style="color:#F5F5F7;font-weight:600;">{leg.option_type.upper()}</span><span style="color:rgba(255,255,255,0.4);">K</span>${leg.strike:.0f}<span style="color:rgba(255,255,255,0.4);">Prem</span>${leg.estimated_premium:.2f}<span style="color:rgba(255,255,255,0.3);margin-left:auto;">Δ{leg.delta:.2f}</span></div>',unsafe_allow_html=True)
+            icr=play.strategy_type=="neutral" or "Short" in play.strategy_name
+            gi=[(("Credit" if icr else "Debit"),f"${play.entry_price:.2f}"),("MaxLoss",f"${play.max_loss:.0f}"),("MaxGain","∞" if play.max_gain==-1 else f"${play.max_gain:.0f}"),("R/R",f"{play.risk_reward_ratio:.1f}x"),("BE",f"${play.break_even:.2f}"),("PoP",f"{play.probability_of_profit}%")]
+            gh='<div class="kg">'
+            for l,v in gi: gh+=f'<div class="kc"><div class="kl">{l}</div><div class="kv">{v}</div></div>'
+            st.markdown(gh+'</div>',unsafe_allow_html=True)
+            if play.hold_duration:
+                st.markdown(f'<div style="display:grid;grid-template-columns:auto 1fr;gap:8px;margin-top:8px;"><div class="kc" style="text-align:center;"><div class="kl">Hold</div><div class="mono" style="font-size:14px;font-weight:700;color:{t_c};">{play.hold_duration}</div></div><div class="kc"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.4;">{play.hold_reasoning}</div></div></div>',unsafe_allow_html=True)
+            if play.price_drivers:
+                for f,e,d in play.price_drivers[:3]:
+                    st.markdown(f'<div class="dr"><span style="font-size:12px;">{e}</span><div><div style="font-family:\'DM Sans\';font-size:10px;font-weight:600;color:#F5F5F7;">{f}</div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);">{d}</div></div></div>',unsafe_allow_html=True)
+            st.markdown(f'<div class="tb" style="margin-top:6px;">{play.thesis}</div>',unsafe_allow_html=True)
+            st.markdown('</div>',unsafe_allow_html=True)
 
-            with st.container(border=True):
-                oh1, oh2 = st.columns([2, 1])
-                with oh1:
-                    st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">'
-                        f'<span style="font-family:\'DM Sans\';font-size:20px;font-weight:700;color:#F5F5F7;">{play.strategy_name}</span>'
-                        f'<span class="b" style="background:{t_b};color:{t_c};font-family:\'JetBrains Mono\';font-size:9px;">{play.strategy_type.replace("_", " ")}</span>'
-                        f'<span class="b" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.5);font-family:\'JetBrains Mono\';font-size:9px;">{play.risk_tier}</span>'
-                        f'</div>'
-                        f'<div class="hm-sub" style="margin-top:6px;">{ot} spot <span style="color:#F5F5F7;font-weight:600;">${sig.price:,.2f}</span> '
-                        f'<span style="color:{chg_c};">{sig.change_1d:+.2f}%</span> · {play.entry_timing}</div>',
-                        unsafe_allow_html=True,
-                    )
-                with oh2:
-                    st.markdown(
-                        f'<div style="text-align:right;"><div class="kl">Est. PoP</div>'
-                        f'<div class="mono" style="font-size:26px;font-weight:700;color:{t_c};">{play.probability_of_profit:.0f}%</div></div>',
-                        unsafe_allow_html=True,
-                    )
-
-                st.markdown(
-                    f'<div class="opt-rhrow">'
-                    f'<div class="opt-cell"><span class="kl">Limit entry (premium)</span><em>${lim_lo:.2f} – ${lim_hi:.2f}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">{limit_hint}</div></div>'
-                    f'<div class="opt-cell"><span class="kl">Take profit (exit)</span><em>${play.profit_target:.2f}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(52,199,89,0.75);margin-top:6px;">≈ {tp_pct:+.0f}% vs entry debit/credit base</div></div>'
-                    f'<div class="opt-cell"><span class="kl">Stop loss</span><em>${play.stop_loss:.2f}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,69,58,0.75);margin-top:6px;">≈ {sl_pct:+.0f}% vs entry</div></div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                st.markdown(
-                    f'<div class="opt-rhrow" style="margin-top:10px;">'
-                    f'<div class="opt-cell"><span class="kl">Breakeven (stock)</span><em>${play.break_even:.2f}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">At expiry, strategy turns green above/below this handle.</div></div>'
-                    f'<div class="opt-cell"><span class="kl">90% CI stock range</span><em>${pt.target_low:,.0f} – ${pt.target_high:,.0f}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">{pt.horizon_days}d · ann. vol {pt.annual_vol:.0f}%</div></div>'
-                    f'<div class="opt-cell"><span class="kl">Exit timing</span><em style="font-size:12px;">{et_short}</em>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.38);margin-top:6px;">Full detail in hold window below.</div></div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                icr = is_credit
-                gi = [
-                    (("Credit" if icr else "Debit"), f"${play.entry_price:.2f}"),
-                    ("Max loss", f"${play.max_loss:.0f}"),
-                    ("Max gain", "∞" if play.max_gain == -1 else f"${play.max_gain:.0f}"),
-                    ("R/R", f"{play.risk_reward_ratio:.1f}x"),
-                    ("Break-even", f"${play.break_even:.2f}"),
-                    ("PoP", f"{play.probability_of_profit:.0f}%"),
-                ]
-                gh = '<div class="kg" style="margin-top:12px;">'
-                for lab, val in gi:
-                    gh += f'<div class="kc"><div class="kl">{lab}</div><div class="kv">{val}</div></div>'
-                st.markdown(gh + "</div>", unsafe_allow_html=True)
-
-                lg_cols = st.columns(len(play.legs))
-                for i, leg in enumerate(play.legs):
-                    dc = "#34C759" if leg.direction == "buy" else "#FF6961"
-                    db = "rgba(52,199,89,0.15)" if leg.direction == "buy" else "rgba(255,105,97,0.15)"
-                    with lg_cols[i]:
-                        st.markdown(
-                            f'<div class="kc" style="min-height:88px;">'
-                            f'<div class="kl">Leg {i + 1}</div>'
-                            f'<div style="margin-top:6px;"><span style="background:{db};color:{dc};font-weight:700;font-size:8px;padding:2px 6px;border-radius:4px;">{leg.direction}</span>'
-                            f' <span class="mono" style="font-size:13px;color:#F5F5F7;">{leg.option_type.upper()} ${leg.strike:.0f}</span></div>'
-                            f'<div class="hm-sub" style="margin-top:8px;">Est. ${leg.estimated_premium:.2f} · Δ {leg.delta:.2f} · {leg.days_to_expiry} DTE</div>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                st.markdown(
-                    f'<div class="kc" style="margin-top:12px;"><div class="kl">Execution checklist</div>'
-                    f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.5;">'
-                    f'1) Place a <strong>limit order</strong> inside the entry band.<br>'
-                    f'2) Set GTC exits: take-profit near <strong>${play.profit_target:.2f}</strong>, stop near <strong>${play.stop_loss:.2f}</strong> on the position premium.<br>'
-                    f'3) Stock risk anchor: <strong>${play.break_even:.2f}</strong> vs spot ${sig.price:.2f}.'
-                    f'</div></div>',
-                    unsafe_allow_html=True,
-                )
-
-                if play.hold_duration:
-                    st.markdown(
-                        f'<div style="display:grid;grid-template-columns:auto 1fr;gap:10px;margin-top:10px;">'
-                        f'<div class="kc" style="text-align:center;"><div class="kl">Hold window</div>'
-                        f'<div class="mono" style="font-size:15px;font-weight:700;color:{t_c};">{play.hold_duration}</div></div>'
-                        f'<div class="kc"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.45);line-height:1.45;">{play.hold_reasoning}</div></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                if play.theta_decay_warning:
-                    st.markdown(
-                        f'<div class="kc" style="margin-top:8px;border-left:2px solid #FF9F0A;"><div class="kl">Theta risk</div>'
-                        f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.theta_decay_warning}</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                if play.optimal_exit_scenario:
-                    st.markdown(
-                        f'<div class="kc" style="margin-top:8px;border-left:2px solid #34C759;"><div class="kl">Optimal exit</div>'
-                        f'<div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.42);line-height:1.4;">{play.optimal_exit_scenario}</div></div>',
-                        unsafe_allow_html=True,
-                    )
-                if play.price_drivers:
-                    st.markdown('<p class="sl" style="margin-top:10px;">Drivers</p>', unsafe_allow_html=True)
-                    for f, e, d in play.price_drivers[:3]:
-                        st.markdown(
-                            f'<div class="dr"><span style="font-size:12px;">{e}</span><div><div style="font-family:\'DM Sans\';font-size:10px;font-weight:600;color:#F5F5F7;">{f}</div>'
-                            f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);">{d}</div></div></div>',
-                            unsafe_allow_html=True,
-                        )
-                if play.risks:
-                    st.markdown('<p class="sl" style="margin-top:8px;">Risk flags</p>', unsafe_allow_html=True)
-                    for rk in play.risks[:3]:
-                        st.markdown(
-                            f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,140,140,0.85);line-height:1.35;padding:2px 0;">• {rk}</div>',
-                            unsafe_allow_html=True,
-                        )
-                st.markdown(f'<div class="tb" style="margin-top:10px;">{play.thesis}</div>', unsafe_allow_html=True)
-
-# ═══ TAB 6: KING NODES HEATMAP ═══════════════════════════════════
+# ═══ TAB 6: SKYLIT-STYLE HEATMAP ═════════════════════════════════
 with tab_heat:
-    st.markdown('<p class="sl">👑 King Nodes — Volume-at-Price Heatmap</p>',unsafe_allow_html=True)
-    st.markdown('<div style="font-family:\'DM Sans\';font-size:11px;color:rgba(255,255,255,0.35);margin-bottom:14px;line-height:1.5;">King nodes are price levels where abnormally high volume was traded — institutional footprints. When price is <strong style="color:#34C759;">above</strong> a king node it acts as <strong style="color:#34C759;">support</strong>; <strong style="color:#FF453A;">below</strong> it acts as <strong style="color:#FF453A;">resistance</strong>. The <span style="color:#0A84FF;">POC</span> (Point of Control) is the single highest-volume level — where the market found fair value.</div>',unsafe_allow_html=True)
+    st.markdown('<p class="sl">👑 Heatseeker-Style Volume Profile · King Nodes · Gatekeepers · Air Pockets</p>',unsafe_allow_html=True)
+    st.markdown('<div style="font-family:\'DM Sans\';font-size:11px;color:rgba(255,255,255,0.35);margin-bottom:12px;line-height:1.5;">Inspired by Skylit\'s Heatseeker framework. <span style="color:#FFD60A;">🟡 Pika zones</span> absorb price (stabilizing — magnetic pillow). <span style="color:#BF5AF2;">🟣 Barney zones</span> amplify price (volatile — gasoline on fire). <span style="color:#0A84FF;">👑 King Nodes</span> = highest volume — price gravitates here. <span style="color:#FF9F0A;">🛡 Gatekeepers</span> = barriers between price and King. <span style="color:rgba(255,255,255,0.5);">💨 Air Pockets</span> = low volume — price flies through.</div>',unsafe_allow_html=True)
 
-    if not king_profiles:
-        st.warning("No volume profile data. Expand the watchlist (include SPY / QQQ) or refresh.")
-    else:
-        keys_avail = sorted(king_profiles.keys())
-        defaults_board = [t for t in ("SPY", "QQQ", "IWM") if t in keys_avail]
-        for t in keys_avail:
-            if len(defaults_board) >= 3:
-                break
-            if t not in defaults_board:
-                defaults_board.append(t)
+    kn_sel=st.selectbox("Ticker",list(king_profiles.keys()),format_func=lambda t:f"{t} — {get_ticker_info(t)[0]}",key="kn_s")
+    kp=king_profiles.get(kn_sel)
+    if kp:
+        sig=signals[kn_sel]
 
-        st.markdown('<p class="sl">Flow board (multi-symbol ladder)</p>', unsafe_allow_html=True)
-        hb1, hb2, hb3, hb4 = st.columns([1, 1, 1.1, 1.3])
-        with hb1:
-            strike_rows = st.selectbox("Strikes shown", [24, 32, 40], index=1, key="hm_rows")
-        with hb2:
-            flow_mode = st.selectbox("Metric", ["Net Flow", "Call Pressure", "Put Pressure"], index=0, key="hm_metric")
-        with hb3:
-            horizon = st.selectbox("Matrix horizon", ["1w", "1m", "2m"], index=1, key="hm_horizon")
-        with hb4:
-            st.markdown(
-                f'<div class="kc"><div class="kl">Desk</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="b" style="background:rgba(52,199,89,0.2);color:#34C759;">LIVE</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.5);">{datetime.now().strftime("%H:%M:%S")}</span></div></div>',
-                unsafe_allow_html=True,
-            )
+        # Regime badge
+        regime_colors={"range_bound":("#FFD60A","rgba(255,214,10,0.12)"),"volatile":("#BF5AF2","rgba(191,90,242,0.12)"),"trending":("#0A84FF","rgba(10,132,255,0.12)")}
+        rc,rb=regime_colors.get(kp.regime,("#F5F5F7","rgba(255,255,255,0.06)"))
+        st.markdown(f'<div style="padding:10px 14px;background:{rb};border:1px solid {rc}30;border-radius:10px;margin-bottom:14px;"><div style="display:flex;align-items:center;gap:8px;"><span class="b" style="background:{rc}25;color:{rc};font-family:\'JetBrains Mono\';font-size:9px;">{kp.regime.replace("_"," ").upper()}</span><span style="font-family:\'DM Sans\';font-size:12px;color:rgba(255,255,255,0.6);">{kp.regime_description}</span></div></div>',unsafe_allow_html=True)
 
-        board_pick = st.multiselect(
-            "Board symbols (max 3)",
-            keys_avail,
-            default=defaults_board[: min(3, len(defaults_board))],
-            max_selections=3,
-            key="hm_board",
-        )
-        bcols = st.columns(3)
-        for idx in range(3):
-            tkb = board_pick[idx] if idx < len(board_pick) else None
-            with bcols[idx]:
-                if tkb and tkb in king_profiles:
-                    kpb = king_profiles[tkb]
-                    sgb = signals[tkb]
-                    chgb = sgb.change_1d
-                    cc_b = "#34C759" if chgb >= 0 else "#FF453A"
-                    kn_max = max(kpb.king_nodes, key=lambda n: n.volume) if kpb.king_nodes else None
-                    kd_b = ((kn_max.price_level - kpb.current_price) / kpb.current_price * 100.0) if kn_max else 0.0
-                    kd_s = f"{kd_b:+.1f}% vs spot" if kn_max else "—"
-                    st.markdown(
-                        f'<div class="kc" style="margin-bottom:8px;padding:10px 12px;"><div class="hm-head">{tkb}</div>'
-                        f'<div class="hm-sub" style="color:#F5F5F7;font-size:12px;">${kpb.current_price:,.2f} <span style="color:{cc_b};">{chgb:+.2f}%</span></div>'
-                        f'<div style="display:flex;justify-content:space-between;margin-top:6px;align-items:center;"><span class="b" style="background:rgba(191,90,242,0.2);color:#BF5AF2;font-size:9px;">King</span>'
-                        f'<span class="mono" style="font-size:10px;color:rgba(255,255,255,0.5);">{kd_s}</span></div></div>',
-                        unsafe_allow_html=True,
-                    )
-                    fboard = build_vertical_flow_panel(kpb, sgb, tkb, strike_rows, flow_mode)
-                    st.plotly_chart(fboard, use_container_width=True, config={"displayModeBar": False}, key=f"board_{tkb}_{idx}")
+        # Volume profile chart with Skylit-style coloring
+        fig=go.Figure()
+        bar_colors=[]
+        mean_v=np.mean(kp.volumes);std_v=np.std(kp.volumes)
+        for lvl,vol in zip(kp.levels,kp.volumes):
+            if vol>=mean_v+2*std_v:
+                bar_colors.append("#0A84FF")  # King node
+            elif vol>=mean_v+1.5*std_v:
+                # Check if Pika or Barney
+                node=next((n for n in kp.all_nodes if abs(n.price_level-lvl)<0.01),None)
+                if node and node.polarity=="pika":
+                    bar_colors.append("#FFD60A")  # Pika — stabilizing
+                elif node and node.polarity=="barney":
+                    bar_colors.append("#BF5AF2")  # Barney — volatile
                 else:
-                    st.caption("—")
-
-        st.markdown('<p class="sl">Detail ticker</p>', unsafe_allow_html=True)
-        kn_sel = st.selectbox("Ticker", keys_avail, format_func=lambda t: f"{t} — {get_ticker_info(t)[0]}", key="kn_s")
-        kp = king_profiles.get(kn_sel)
-        if not kp:
-            st.warning("No volume profile for this ticker.")
-        else:
-            sig = signals[kn_sel]
-            node_by_price = {round(n.price_level, 2): n for n in kp.king_nodes}
-            above_nodes = sorted([n for n in kp.king_nodes if n.price_level > kp.current_price], key=lambda n: n.price_level)
-            below_nodes = sorted([n for n in kp.king_nodes if n.price_level < kp.current_price], key=lambda n: n.price_level, reverse=True)
-            top_king = next((n for n in kp.king_nodes if n.strength == "king"), kp.king_nodes[0] if kp.king_nodes else None)
-            nearest_above = min(above_nodes, key=lambda n: n.price_level - kp.current_price) if above_nodes else None
-            nearest_below = min(below_nodes, key=lambda n: kp.current_price - n.price_level) if below_nodes else None
-
-            with st.expander("Expiry × strike matrix (detail ticker)", expanded=False):
-                strike_prices = _heatmap_strike_window(kp, strike_rows)
-                if horizon == "1w":
-                    expiry_steps = [0, 3, 7, 10]
-                elif horizon == "2m":
-                    expiry_steps = [0, 14, 30, 45]
-                else:
-                    expiry_steps = [0, 7, 14, 28]
-                expiry_labels = [(pd.Timestamp.today() + pd.Timedelta(days=d)).strftime("%Y-%m-%d") for d in expiry_steps]
-
-                z_vals = []
-                text_vals = []
-                sigma = max(0.25, (max(kp.levels) - min(kp.levels)) / 20)
-                direction_sign = 1.0 if sig.direction == "bullish" else -1.0 if sig.direction == "bearish" else 0.0
-                for s_px in strike_prices:
-                    row = []
-                    row_text = []
-                    rel_side = 1.0 if s_px < kp.current_price else -1.0
-                    for j, d in enumerate(expiry_steps):
-                        node_influence = 0.0
-                        for kn in kp.king_nodes:
-                            dist = abs(s_px - kn.price_level)
-                            falloff = np.exp(-(dist / sigma) ** 2)
-                            node_sign = 1.0 if kn.node_type in ("support", "poc") else -1.0
-                            node_weight = 1.0 if kn.strength == "king" else 0.7 if kn.strength == "major" else 0.45
-                            node_influence += node_sign * node_weight * kn.volume_pct * falloff
-                        tenor_decay = max(0.35, 1.0 - j * 0.18)
-                        directional = direction_sign * 22.0 + rel_side * 12.0
-                        seasonal = np.sin((s_px * 0.05) + (j * 0.8)) * 4.0
-                        raw = (node_influence * 1.8 + directional + seasonal) * tenor_decay
-                        if flow_mode == "Call Pressure":
-                            raw = max(raw, 0.0)
-                        elif flow_mode == "Put Pressure":
-                            raw = min(raw, 0.0)
-                        row.append(raw)
-                        row_text.append(f"${raw:,.1f}K")
-                    z_vals.append(row)
-                    text_vals.append(row_text)
-
-                heat = go.Figure(
-                    data=[
-                        go.Heatmap(
-                            z=z_vals,
-                            x=expiry_labels,
-                            y=strike_prices,
-                            text=text_vals,
-                            texttemplate="%{text}",
-                            textfont={"size": 10, "color": "rgba(245,245,247,0.92)", "family": "JetBrains Mono"},
-                            colorscale=[
-                                [0.0, "#7A1D2A"],
-                                [0.25, "#4C286B"],
-                                [0.5, "#332455"],
-                                [0.7, "#2E5B88"],
-                                [0.85, "#2EA7B8"],
-                                [1.0, "#FFD166"],
-                            ],
-                            zmid=0,
-                            showscale=False,
-                            hovertemplate="Strike %{y}<br>Expiry %{x}<br>Flow %{z:,.1f}K<extra></extra>",
-                        )
-                    ]
-                )
-                heat.add_hline(
-                    y=kp.current_price,
-                    line_color="rgba(245,245,247,0.6)",
-                    line_width=1.5,
-                    line_dash="dot",
-                )
-                heat.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    margin=dict(l=0, r=0, t=8, b=0),
-                    height=560,
-                    font=dict(family="DM Sans", size=10, color="rgba(255,255,255,0.65)"),
-                    xaxis=dict(side="top", showgrid=False, zeroline=False, title="Expiry"),
-                    yaxis=dict(showgrid=False, zeroline=False, title="Strike", tickformat=".1f"),
-                )
-                st.plotly_chart(heat, use_container_width=True, config={"displayModeBar": False}, key=f"flow_heat_{kn_sel}")
-
-            chart_cols = st.columns(2)
-            with chart_cols[0]:
-                # Volume profile chart (horizontal bar chart of volume at each price level)
-                fig = go.Figure()
-                bar_colors = []
-                for lvl, vol in zip(kp.levels, kp.volumes):
-                    kn = node_by_price.get(round(lvl, 2))
-                    if kn and kn.strength == "king":
-                        bar_colors.append("#0A84FF")
-                    elif kn and kn.strength == "major":
-                        bar_colors.append("#BF5AF2")
-                    elif lvl < kp.current_price:
-                        bar_colors.append("rgba(52,199,89,0.4)")
-                    else:
-                        bar_colors.append("rgba(255,69,58,0.4)")
-
-                fig.add_trace(go.Bar(y=[round(l, 2) for l in kp.levels], x=kp.volumes, orientation='h', marker_color=bar_colors, marker_line_width=0, hovertemplate="Price: $%{y:.2f}<br>Volume: %{x:,.0f}<extra></extra>"))
-                fig.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_size=10, annotation_font_color="#F5F5F7")
-                fig.add_hline(y=kp.poc, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"POC ${kp.poc:.2f}", annotation_font_size=10, annotation_font_color="#0A84FF", annotation_position="bottom right")
-                fig.add_hrect(y0=kp.val, y1=kp.vah, fillcolor="rgba(10,132,255,0.06)", line_width=0, annotation_text="Value Area (70%)", annotation_font_size=9, annotation_font_color="rgba(10,132,255,0.5)")
-                fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10), margin=dict(l=0, r=0, t=20, b=0), xaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Volume"), yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"), height=450, showlegend=False)
-                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False}, key=f"vp_{kn_sel}")
-
-            with chart_cols[1]:
-                ladder = go.Figure()
-                max_vol = max(kp.volumes) if kp.volumes else 1.0
-                xs, ys, sizes, colors, labels, hover = [], [], [], [], [], []
-                for kn in kp.king_nodes:
-                    side_x = 1 if kn.price_level > kp.current_price else -1 if kn.price_level < kp.current_price else 0
-                    base_color = "#0A84FF" if kn.strength == "king" else "#BF5AF2" if kn.strength == "major" else "rgba(255,255,255,0.45)"
-                    xs.append(side_x)
-                    ys.append(kn.price_level)
-                    sizes.append(10 + (kn.volume / max_vol) * 22)
-                    colors.append(base_color)
-                    labels.append("👑" if kn.strength == "king" else "◆")
-                    hover.append(f"${kn.price_level:.2f}<br>{kn.node_type.title()}<br>{kn.volume_pct:.1f}% volume<br>{kn.distance_pct:+.2f}% from current")
-
-                ladder.add_trace(go.Scatter(
-                    x=xs,
-                    y=ys,
-                    mode="markers+text",
-                    text=labels,
-                    textposition="middle center",
-                    marker=dict(size=sizes, color=colors, line=dict(color="rgba(255,255,255,0.3)", width=1)),
-                    hovertext=hover,
-                    hovertemplate="%{hovertext}<extra></extra>",
-                    showlegend=False,
-                ))
-                ladder.add_hline(y=kp.current_price, line_color="#F5F5F7", line_width=2, annotation_text=f"Current ${kp.current_price:.2f}", annotation_font_color="#F5F5F7", annotation_font_size=10)
-                ladder.add_vline(x=0, line_color="rgba(255,255,255,0.15)", line_dash="dot")
-                if top_king:
-                    ladder.add_hline(y=top_king.price_level, line_color="#0A84FF", line_width=2, line_dash="dot", annotation_text=f"King ${top_king.price_level:.2f}", annotation_font_color="#0A84FF", annotation_font_size=10)
-
-                ladder.update_layout(
-                    paper_bgcolor="rgba(0,0,0,0)",
-                    plot_bgcolor="rgba(0,0,0,0)",
-                    font=dict(family="DM Sans", color="rgba(255,255,255,0.5)", size=10),
-                    margin=dict(l=0, r=0, t=20, b=0),
-                    height=450,
-                    xaxis=dict(
-                        range=[-1.5, 1.5],
-                        tickmode="array",
-                        tickvals=[-1, 0, 1],
-                        ticktext=["Below Price", "Current", "Above Price"],
-                        gridcolor="rgba(255,255,255,0.04)",
-                        zeroline=False,
-                        title="Vertical Price Ladder",
-                    ),
-                    yaxis=dict(gridcolor="rgba(255,255,255,0.04)", title="Price"),
-                    showlegend=False,
-                )
-                st.plotly_chart(ladder, use_container_width=True, config={"displayModeBar": False}, key=f"ladder_{kn_sel}")
-
-            # King node details
-            st.markdown('<p class="sl">Key Levels</p>',unsafe_allow_html=True)
-            kn_cols=st.columns(4)
-            kn_cols[0].metric("POC (Fair Value)",f"${kp.poc:.2f}")
-            kn_cols[1].metric("Value Area High",f"${kp.vah:.2f}")
-            kn_cols[2].metric("Value Area Low",f"${kp.val:.2f}")
-            kn_cols[3].metric("Dominant King", f"${top_king.price_level:.2f}" if top_king else "—")
-
-            def node_strength_weight(node):
-                if not node:
-                    return 0.0
-                return 1.0 if node.strength == "king" else 0.75 if node.strength == "major" else 0.45
-
-            def distance_weight(node):
-                if not node:
-                    return 0.0
-                d = abs(node.distance_pct)
-                if d <= 1.0:
-                    return 1.0
-                if d <= 2.5:
-                    return 0.85
-                if d <= 4.0:
-                    return 0.65
-                if d <= 6.0:
-                    return 0.4
-                return 0.2
-
-            def node_quality_score(node):
-                if not node:
-                    return 0.0
-                volume_component = min(1.0, node.volume_pct / 12.0)
-                strength_component = node_strength_weight(node)
-                proximity_component = distance_weight(node)
-                return (0.45 * strength_component) + (0.35 * volume_component) + (0.20 * proximity_component)
-
-            trend_bull = 1 if sig.direction == "bullish" else 0
-            trend_bear = 1 if sig.direction == "bearish" else 0
-            conf_component = min(1.0, sig.confidence / 100.0)
-            vol_confirm = min(1.0, sig.volume_ratio / 2.2)
-            momentum_bull = 1.0 if sig.momentum > 0 and sig.macd_hist > 0 else 0.55 if sig.momentum > 0 else 0.25
-            momentum_bear = 1.0 if sig.momentum < 0 and sig.macd_hist < 0 else 0.55 if sig.momentum < 0 else 0.25
-
-            support_quality = node_quality_score(nearest_below)
-            resistance_quality = node_quality_score(nearest_above)
-            king_location_bull = 1.0 if top_king and top_king.price_level < kp.current_price else 0.45
-            king_location_bear = 1.0 if top_king and top_king.price_level > kp.current_price else 0.45
-
-            call_score_raw = (
-                100
-                * (
-                    0.34 * support_quality
-                    + 0.16 * king_location_bull
-                    + 0.18 * conf_component
-                    + 0.14 * vol_confirm
-                    + 0.10 * momentum_bull
-                    + 0.08 * trend_bull
-                )
-            )
-            put_score_raw = (
-                100
-                * (
-                    0.34 * resistance_quality
-                    + 0.16 * king_location_bear
-                    + 0.18 * conf_component
-                    + 0.14 * vol_confirm
-                    + 0.10 * momentum_bear
-                    + 0.08 * trend_bear
-                )
-            )
-
-            if nearest_below and abs(nearest_below.distance_pct) > profile_cfg["distance_penalty"]:
-                call_score_raw *= 0.75
-            if nearest_above and abs(nearest_above.distance_pct) > profile_cfg["distance_penalty"]:
-                put_score_raw *= 0.75
-
-            call_conf = min(99, round(call_score_raw, 1))
-            put_conf = min(99, round(put_score_raw, 1))
-            bias = "CALL bias" if call_conf > put_conf else "PUT bias" if put_conf > call_conf else "NEUTRAL"
-            bias_color = "#34C759" if "CALL" in bias else "#FF453A" if "PUT" in bias else "#FFD60A"
-
-            bias_cols = st.columns(3)
-            bias_cols[0].metric("Nearest Support", f"${nearest_below.price_level:.2f}" if nearest_below else "—", f"{nearest_below.distance_pct:+.1f}%" if nearest_below else None)
-            bias_cols[1].metric("Nearest Resistance", f"${nearest_above.price_level:.2f}" if nearest_above else "—", f"{nearest_above.distance_pct:+.1f}%" if nearest_above else None)
-            bias_cols[2].metric("Options Reliability", f"{max(call_conf, put_conf):.0f}%")
-
-            def reliability_label(score):
-                adj_score = score + profile_cfg["reliability_shift"]
-                if adj_score >= 78:
-                    return "Institutional Grade"
-                if adj_score >= 65:
-                    return "Tradable"
-                if adj_score >= 52:
-                    return "Tactical Only"
-                return "Low Edge"
-
-            lead_score = max(call_conf, put_conf)
-            rel_label = reliability_label(lead_score)
-            st.markdown(
-                f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px;">Directional Read from King Nodes</div><div style="display:flex;justify-content:space-between;align-items:center;"><span class="mono" style="font-size:13px;font-weight:700;color:{bias_color};">{bias}</span><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.55);">Call {call_conf:.0f}% · Put {put_conf:.0f}%</span></div><div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;"><span class="b" style="background:rgba(255,255,255,0.07);color:#F5F5F7;font-family:\'JetBrains Mono\';font-size:9px;">{rel_label}</span><span class="mono" style="font-size:10px;color:rgba(255,255,255,0.45);">Model {sig.confidence:.0f}% · RVol {sig.volume_ratio:.1f}x</span></div><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);margin-top:6px;line-height:1.4;">Reliability combines node strength, distance from spot, volume concentration, trend/momentum alignment, and model conviction. In {trader_profile.lower()} mode, prefer nearest structural levels within ±{profile_cfg["near_node_pct"]:.1f}% and king/major nodes.</div></div>',
-                unsafe_allow_html=True,
-            )
-
-            if bias == "CALL bias" and nearest_below and nearest_above:
-                entry_zone = f"${(nearest_below.price_level + kp.current_price) / 2:.2f}–${kp.current_price:.2f}"
-                invalidation = f"Daily close below ${nearest_below.price_level * 0.995:.2f}"
-                target_1 = f"${nearest_above.price_level:.2f}"
-                target_2 = f"${(nearest_above.price_level + (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
-            elif bias == "PUT bias" and nearest_below and nearest_above:
-                entry_zone = f"${kp.current_price:.2f}–${(nearest_above.price_level + kp.current_price) / 2:.2f}"
-                invalidation = f"Daily close above ${nearest_above.price_level * 1.005:.2f}"
-                target_1 = f"${nearest_below.price_level:.2f}"
-                target_2 = f"${(nearest_below.price_level - (nearest_above.price_level - nearest_below.price_level) * 0.6):.2f}"
+                    bar_colors.append("#FF9F0A")  # Gatekeeper
+            elif vol>=mean_v+std_v:
+                bar_colors.append("rgba(255,159,10,0.5)")  # Gatekeeper/cluster
+            elif vol<mean_v-0.5*std_v:
+                bar_colors.append("rgba(255,255,255,0.08)")  # Air pocket
+            elif lvl<kp.current_price:
+                bar_colors.append("rgba(52,199,89,0.3)")
             else:
-                entry_zone = "Wait for cleaner structure"
-                invalidation = "N/A"
-                target_1 = "N/A"
-                target_2 = "N/A"
+                bar_colors.append("rgba(255,69,58,0.3)")
 
-            size_note = "0.5x size unless Institutional Grade" if trader_profile == "Conservative" else "normal size if Tradable+" if trader_profile == "Balanced" else "can scale faster, respect invalidation strictly"
-            st.markdown(
-                f'<div class="kc" style="margin-top:8px;"><div style="font-family:\'DM Sans\';font-size:10px;color:rgba(255,255,255,0.35);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:8px;">Execution Plan (Professional Framing)</div><div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;"><div class="kc"><div class="kl">Entry Zone</div><div class="mono" style="font-size:12px;color:#F5F5F7;">{entry_zone}</div></div><div class="kc"><div class="kl">Invalidation</div><div class="mono" style="font-size:12px;color:#FF9F0A;">{invalidation}</div></div><div class="kc"><div class="kl">Target 1</div><div class="mono" style="font-size:12px;color:#34C759;">{target_1}</div></div><div class="kc"><div class="kl">Target 2</div><div class="mono" style="font-size:12px;color:#34C759;">{target_2}</div></div></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:6px;">Profile rule ({trader_profile}): {size_note}. Reduce size if nearest node is beyond {profile_cfg["distance_penalty"]:.1f}% from spot.</div></div>',
-                unsafe_allow_html=True,
-            )
+        fig.add_trace(go.Bar(y=[round(l,2) for l in kp.levels],x=kp.volumes,orientation='h',marker_color=bar_colors,marker_line_width=0,hovertemplate="$%{y:.2f} — Vol: %{x:,.0f}<extra></extra>"))
+        fig.add_hline(y=kp.current_price,line_color="#F5F5F7",line_width=2,annotation_text=f"NOW ${kp.current_price:.2f}",annotation_font_size=10,annotation_font_color="#F5F5F7")
+        fig.add_hline(y=kp.poc,line_color="#0A84FF",line_width=2,line_dash="dot",annotation_text=f"POC ${kp.poc:.2f}",annotation_font_size=10,annotation_font_color="#0A84FF",annotation_position="bottom right")
+        fig.add_hrect(y0=kp.val,y1=kp.vah,fillcolor="rgba(10,132,255,0.05)",line_width=0)
+        # Mark air pockets
+        for ap in kp.air_pockets[:3]:
+            fig.add_hline(y=ap.price_level,line_color="rgba(255,255,255,0.15)",line_width=1,line_dash="dash")
+        # Mark king node
+        if kp.king_node:
+            fig.add_hline(y=kp.king_node.price_level,line_color="#0A84FF",line_width=3,annotation_text=f"👑 KING ${kp.king_node.price_level:.2f}",annotation_font_size=11,annotation_font_color="#0A84FF")
 
-            if kp.king_nodes:
-                st.markdown('<p class="sl">Detected Nodes</p>',unsafe_allow_html=True)
-                cols=st.columns(2)
-                for i,kn in enumerate(kp.king_nodes[:8]):
-                    nc="#0A84FF" if kn.strength=="king" else "#BF5AF2" if kn.strength=="major" else "rgba(255,255,255,0.4)"
-                    icon="👑" if kn.strength=="king" else "◆" if kn.strength=="major" else "·"
-                    type_c="#34C759" if kn.node_type=="support" else "#FF453A" if kn.node_type=="resistance" else "#0A84FF"
-                    with cols[i%2]:
-                        st.markdown(f'<div class="kc" style="margin-bottom:6px;"><div style="display:flex;justify-content:space-between;align-items:center;"><div><span style="font-size:14px;">{icon}</span> <span class="mono" style="font-size:14px;font-weight:600;color:{nc};">${kn.price_level:.2f}</span><span class="b" style="background:{type_c}18;color:{type_c};margin-left:6px;font-family:\'JetBrains Mono\';font-size:8px;">{kn.node_type}</span></div><span class="mono" style="font-size:11px;color:rgba(255,255,255,0.4);">{kn.volume_pct:.1f}% vol</span></div><div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.3);margin-top:3px;">{kn.distance_pct:+.1f}% from current · {kn.strength.title()} node</div></div>',unsafe_allow_html=True)
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",font=dict(family="DM Sans",color="rgba(255,255,255,0.5)",size=10),margin=dict(l=0,r=0,t=20,b=0),xaxis=dict(gridcolor="rgba(255,255,255,0.04)",title="Volume"),yaxis=dict(gridcolor="rgba(255,255,255,0.04)",title="Price"),height=450,showlegend=False)
+        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False},key=f"vp_{kn_sel}")
 
-            st.markdown('<p class="sl">King Node Summary — All Tickers</p>',unsafe_allow_html=True)
-            kn_tbl=[]
-            for t in sorted(king_profiles.keys()):
-                vp=king_profiles[t];s=signals[t]
-                kings=[kn for kn in vp.king_nodes if kn.strength=="king"]
-                nearest=min(vp.king_nodes,key=lambda n:abs(n.distance_pct)) if vp.king_nodes else None
-                kn_tbl.append({"Ticker":t,"Price":f"${vp.current_price:.2f}","POC":f"${vp.poc:.2f}","VAH":f"${vp.vah:.2f}","VAL":f"${vp.val:.2f}","King Nodes":len(kings),"Nearest":f"${nearest.price_level:.2f} ({nearest.distance_pct:+.1f}%)" if nearest else "—","Type":nearest.node_type if nearest else "—"})
-            st.dataframe(pd.DataFrame(kn_tbl),use_container_width=True,hide_index=True,height=min(380,40+len(kn_tbl)*34))
+        # Key levels
+        kc1,kc2,kc3,kc4=st.columns(4)
+        kc1.metric("👑 King Node",f"${kp.king_node.price_level:.2f}" if kp.king_node else "—")
+        kc2.metric("POC",f"${kp.poc:.2f}")
+        kc3.metric("Value Area High",f"${kp.vah:.2f}")
+        kc4.metric("Value Area Low",f"${kp.val:.2f}")
 
-st.markdown('<div style="height:16px"></div><p style="font-size:8px;color:rgba(255,255,255,0.08);text-align:center;padding:10px 0;">Signal · yfinance + Finnhub · Educational use only. Not financial advice.</p>',unsafe_allow_html=True)
+        # Node cards — 2-column grid
+        node_sections=[
+            ("👑 King & Gatekeepers",[n for n in kp.all_nodes if n.node_type in ("king","gatekeeper")][:6]),
+            ("🟡 Pika Zones (Stabilizing)",kp.pika_zones[:4]),
+            ("🟣 Barney Zones (Volatile)",kp.barney_zones[:4]),
+            ("💨 Air Pockets (Fast Move)",kp.air_pockets[:4]),
+        ]
+        for section_title,nodes in node_sections:
+            if not nodes: continue
+            st.markdown(f'<p class="sl">{section_title}</p>',unsafe_allow_html=True)
+            cols=st.columns(2)
+            for i,n in enumerate(nodes):
+                polarity_icon="🟡" if n.polarity=="pika" else "🟣" if n.polarity=="barney" else "💨" if n.node_type=="air_pocket" else "👑" if n.node_type=="king" else "🛡"
+                nc="#FFD60A" if n.polarity=="pika" else "#BF5AF2" if n.polarity=="barney" else "#0A84FF" if n.node_type=="king" else "#FF9F0A" if n.node_type=="gatekeeper" else "rgba(255,255,255,0.4)"
+                role_c="#34C759" if n.role=="support" else "#FF453A" if n.role=="resistance" else "#0A84FF"
+                fresh="🔵 Fresh" if n.times_tested<3 else f"🔘 {n.times_tested}x tested"
+                with cols[i%2]:
+                    st.markdown(
+                        f'<div class="kc" style="margin-bottom:6px;">'
+                        f'<div style="display:flex;justify-content:space-between;align-items:center;">'
+                        f'<div><span style="font-size:13px;">{polarity_icon}</span> <span class="mono" style="font-size:13px;font-weight:600;color:{nc};">${n.price_level:.2f}</span>'
+                        f'<span class="b" style="background:{role_c}18;color:{role_c};margin-left:5px;font-family:\'JetBrains Mono\';font-size:7px;">{n.role}</span></div>'
+                        f'<span class="mono" style="font-size:10px;color:rgba(255,255,255,0.35);">{n.volume_pct:.1f}% vol · {n.distance_pct:+.1f}%</span></div>'
+                        f'<div style="font-family:\'DM Sans\';font-size:9px;color:rgba(255,255,255,0.35);margin-top:3px;line-height:1.4;">{n.description}</div>'
+                        f'<div style="font-family:\'JetBrains Mono\';font-size:8px;color:rgba(255,255,255,0.2);margin-top:2px;">{fresh} · Strength: {n.strength:.0f}/100</div>'
+                        f'</div>',unsafe_allow_html=True)
+
+        # All-tickers summary
+        st.markdown('<p class="sl">All Tickers — Node Summary</p>',unsafe_allow_html=True)
+        kn_tbl=[]
+        for t in sorted(king_profiles.keys()):
+            vp=king_profiles[t]
+            kings=[n for n in vp.all_nodes if n.node_type=="king"]
+            gk=[n for n in vp.all_nodes if n.node_type=="gatekeeper"]
+            ap=[n for n in vp.all_nodes if n.node_type=="air_pocket"]
+            pk=[n for n in vp.all_nodes if n.polarity=="pika"]
+            bn=[n for n in vp.all_nodes if n.polarity=="barney"]
+            nearest=min(vp.all_nodes,key=lambda n:abs(n.distance_pct)) if vp.all_nodes else None
+            kn_tbl.append({"Ticker":t,"Price":f"${vp.current_price:.2f}","POC":f"${vp.poc:.2f}","Regime":vp.regime.replace("_"," ").title(),"👑 Kings":len(kings),"🛡 GK":len(gk),"💨 Air":len(ap),"🟡 Pika":len(pk),"🟣 Barney":len(bn),"Nearest":f"${nearest.price_level:.2f} ({nearest.distance_pct:+.1f}%)" if nearest else "—"})
+        st.dataframe(pd.DataFrame(kn_tbl),use_container_width=True,hide_index=True,height=min(380,40+len(kn_tbl)*34))
+    else:
+        st.warning("No volume profile data for this ticker.")
+
+st.markdown('<div style="height:16px"></div><p style="font-size:8px;color:rgba(255,255,255,0.08);text-align:center;padding:10px 0;">Signal · yfinance + Finnhub · Skylit-inspired concepts · Educational use only. Not financial advice.</p>',unsafe_allow_html=True)
